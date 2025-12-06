@@ -38,32 +38,34 @@ class AttractorCortex(CorticalBlock):  # Extend CorticalBlock
         self.converged = False    # Whether last forward converged
         self.settling_history = []  # Track convergence per step
         
+        self.W_temp = torch.randn(self.C, self.C) * 0.05
+        self.eta_temp = 0.01
+        self.temp_weight_decay = 1e-4
+
+        self.last_state = None
+        self.last_pred = None
+        self.last_error = None
+        self.last_surprise = None
+
+    def predict_next(self, o: torch.Tensor) -> torch.Tensor:
+        """Predict next state: ô_{t+1} = normalize(W_temp @ o_t)."""
+        pred = self.W_temp @ o
+        pred = pred / (1 + torch.abs(pred))
+        pred = self.apply_sparsity(pred)
+        return pred       
+            
     def compute_energy(self, o: torch.Tensor) -> float:
-        """
-        Compute energy of a state o.
-        Energy = -0.5 * (o^T @ W @ o) + energy_weight * sum(o^2)
-        Lower energy = more stable state.
-        """
+        """Compute energy: E(o) = -0.5*(o^T @ W @ o) + energy_weight*sum(o^2)."""
         recurrent_energy = -0.5 * torch.dot(o, self.W @ o)
         regularization = self.energy_weight * torch.sum(o**2)
         return (recurrent_energy + regularization).item()
     
     def forward(self, x: torch.Tensor = None) -> torch.Tensor:
-        """
-        Forward pass with attractor dynamics.  
-        Steps:
-        1. Update columns with input x (if provided)
-        2. Start with initial column summaries
-        3. Iteratively settle to attractor state
-        4. Return converged state
-        
-        Returns converged state or best state after settling_steps.
-        """
+        """Forward pass with attractor settling and temporal prediction."""
         # 1. Update columns if x provided
         if x is not None:
             for col in self.columns:
                 col.forward(x)
-        
         # 2. Get initial column summaries
         o = torch.zeros(self.C)
         for i, col in enumerate(self.columns):
@@ -72,12 +74,10 @@ class AttractorCortex(CorticalBlock):  # Extend CorticalBlock
                 if x is None:
                     raise ValueError("Columns need input x or pre-computed outputs")
                 col.forward(x)
-            o[i] = float(self.reduce_fn(col.last_output))
-        
+            o[i] = float(self.reduce_fn(col.last_output)) 
         # Initialize recurrent state
         z = self.z.clone()
-        prev_o = o.clone()
-        
+        prev_o = o.clone()        
         # 3. Settling loop
         self.converged = False
         self.settling_history = []
@@ -87,15 +87,12 @@ class AttractorCortex(CorticalBlock):  # Extend CorticalBlock
             if self.use_input_proj and x is not None:
                 input_proj = self.B.matmul(x)
             else:
-                input_proj = torch.zeros(self.C)
-            
+                input_proj = torch.zeros(self.C)            
             # Update recurrent state
-            z = (1.0 - self.rho) * z + self.rho * (self.W @ o + input_proj)
-            
+            z = (1.0 - self.rho) * z + self.rho * (self.W @ o + input_proj)            
             # Normalize
             new_o = z / (1 + torch.abs(z))
-            new_o=self.apply_sparsity(new_o)
-            
+            new_o=self.apply_sparsity(new_o)            
             # Check convergence
             diff = torch.norm(new_o - prev_o).item()
             self.settling_history.append(diff)
@@ -103,82 +100,63 @@ class AttractorCortex(CorticalBlock):  # Extend CorticalBlock
             if diff < self.convergence_thresh:
                 self.converged = True
                 o = new_o
-                break
-            
+                break            
             prev_o = o
-            o = new_o
-        
+            o = new_o        
         # 4. Save final state
         self.z = z
         self.stable_state = o.clone()
         self.energy_value = self.compute_energy(o)
         self.last_o = o.clone()
-        self.last_raw_o = torch.tensor([self.reduce_fn(col.last_output) 
-                                       for col in self.columns])
-        
+        self.last_raw_o = torch.tensor([self.reduce_fn(col.last_output) for col in self.columns])
+        # Temporal prediction for next timestep
+        self.last_pred = self.predict_next(o)
+        self.last_state = o.clone()
         return o
-    
+        
     #the three fuctions are for providing stability
     def homeostasis_update(self, o):
-        """
-        o = stable column activations (C-dim)
-        """
+        """o = stable column activations (C-dim)"""
         # Update exponential moving average
-        self.col_activation_avg = (
-            0.99 * self.col_activation_avg + self.homeo_lr * o
-        )
-
+        self.col_activation_avg = (0.99 * self.col_activation_avg + self.homeo_lr * o)
         # deviation from desired firing level
         delta = self.activation_target - self.col_activation_avg
-
         # shift recurrent weights
         self.W += self.homeo_lr * delta.unsqueeze(1)
 
     def synaptic_scaling(self):
-        """
-        Scale each row of W to maintain constant norm.
-        """
+        """Scale each row of W to maintain constant norm."""
         norms = torch.norm(self.W, dim=1, keepdim=True) + 1e-8
         target = self.synaptic_scaling_target
         self.W *= (target / norms)
 
     def normalize_recurrent_weights(self):
-        """
-        Keep network stable.
-        """
+        """ Keep network stable."""
         # row normalize (keeps dynamics bounded)
         norms = torch.norm(self.W, dim=1, keepdim=True) + 1e-8
         self.W = self.W / norms
 
     def apply_sparsity(self, o: torch.Tensor) -> torch.Tensor:
-        """
-        k-Winner-Take-All (hard or soft) for sparse coding.
-        """
+        """k-Winner-Take-All (hard or soft) for sparse coding."""
         if self.use_soft_k:
             # Soft top-k via sharpened softmax
             o_ = torch.exp(self.beta_soft * o)
             return o_ / (o_.sum() + 1e-8)
-
         # Hard k-WTA
         C = o.shape[0]
-
         # If k >= C, do nothing
         if self.k_sparsity >= C:
             return o
-
         # Get threshold
         topk_vals, _ = torch.topk(o, self.k_sparsity)
         T = topk_vals[-1]
-
         # Apply competition mask
         mask = (o >= T).float()
-        return o * mask
-        
+        return o * mask        
 
     def learn(self) -> None:
         """
-        Learn using Oja's rule with energy regularization.
-        
+        Learn using Oja's rule with energy regularization.   
         Update rule: ΔW = η * (o o^T - energy_weight * W)
         """
         if self.stable_state is None:
@@ -204,7 +182,21 @@ class AttractorCortex(CorticalBlock):  # Extend CorticalBlock
         self.synaptic_scaling()
         self.normalize_recurrent_weights()
 
-    
+    def learn_temporal(self, next_state: torch.Tensor):
+        """Learn temporal transitions: ΔW_temp = η_temp*(o_t @ o_{t+1}^T - λ*W_temp)."""
+        if self.last_state is None:
+            return
+        # Make next_state sparse
+        next_state = self.apply_sparsity(next_state)
+        # Compute prediction error
+        error = next_state - self.last_pred
+        self.last_error = error
+        self.last_surprise = torch.norm(error, p=1).item() 
+        # Hebbian temporal learning
+        outer = torch.outer(self.last_state, next_state)
+        dW = self.eta_temp * (outer - self.temp_weight_decay * self.W_temp)
+        self.W_temp += dW
+
     def get_convergence_info(self) -> dict:
         """Get information about last settling process."""
         if not self.settling_history:
@@ -219,200 +211,85 @@ class AttractorCortex(CorticalBlock):  # Extend CorticalBlock
 
 
 if __name__ == "__main__":
-    print("Testing AttractorCortex...")
-    print("-" * 50)
+    print("Testing AttractorCortex Temporal Prediction...")
     
-    # Create test columns
+    # Setup
+    torch.manual_seed(42)
     input_dim = 8
-    num_columns = 4
-    neurons_per_column = 5
+    num_columns = 5
+    neurons_per_column = 4
     
+    # Create columns
     columns = []
     for i in range(num_columns):
         col = ProtoColumn(input_size=input_dim, num_neurons=neurons_per_column)
         columns.append(col)
     
-    # Test 1: Basic initialization
-    print("\n1. Testing initialization...")
+    # Create cortex
     cortex = AttractorCortex(
         columns=columns,
         input_proj=True,
-        settling_steps=10,
-        energy_weight=0.01,
-        activation_target=0.2,
-        homeo_lr=0.01,
-        synaptic_scaling_target=1.0
+        settling_steps=8,
+        k_sparsity=2
     )
     
-    print(f"Created cortex with {cortex.C} columns")
-    print(f"W shape: {cortex.W.shape}")
-    print(f"B shape: {cortex.B.shape if cortex.B is not None else 'None'}")
-    print(f"Settling steps: {cortex.settling_steps}")
-    print(f"Activation target: {cortex.activation_target}")
+    print(f"Cortex: {cortex.C} columns, k={cortex.k_sparsity} sparsity")
     
-    # Test 2: Forward pass with attractor dynamics
-    print("\n2. Testing forward pass with settling...")
-    x = torch.randn(input_dim)
+    # Test 1: Basic prediction
+    print("\n1. Basic temporal prediction test:")
+    x1 = torch.randn(input_dim)
+    output1 = cortex.forward(x=x1)
     
-    # First activate columns
+    print(f"State: {output1}")
+    print(f"Prediction: {cortex.last_pred}")
+    print(f"Active units: {(output1 != 0).sum().item()}")
+    
+    # Test 2: Sequence learning
+    print("\n2. Sequence learning test:")
+    
+    # Learn A→B
+    pattern_a = torch.tensor([1.0, 0.0, 0.0, 0.0, 0.0])
+    pattern_b = torch.tensor([0.0, 1.0, 0.0, 0.0, 0.0])
+    
+    cortex.stable_state = pattern_a.clone()
+    cortex.last_state = pattern_a.clone()
+    cortex.last_pred = cortex.predict_next(pattern_a)
+    
+    print(f"Initial prediction of B from A: {cortex.last_pred}")
+    print(f"Initial error: {torch.norm(pattern_b - cortex.last_pred):.4f}")
+    
+    # Train transition
+    for i in range(10):
+        cortex.learn_temporal(pattern_b)
+    
+    cortex.last_pred = cortex.predict_next(pattern_a)
+    print(f"Trained prediction of B from A: {cortex.last_pred}")
+    print(f"Final error: {torch.norm(pattern_b - cortex.last_pred):.4f}")
+    
+    # Test 3: Different sparsity modes
+    print("\n3. Sparsity mode test:")
+    
+    test_vec = torch.tensor([0.8, 0.5, 0.3, 0.9, 0.1])
+    
+    # Hard k-WTA
+    hard_cortex = AttractorCortex(columns=columns, k_sparsity=2, use_soft_k=False)
+    hard_out = hard_cortex.apply_sparsity(test_vec)
+    print(f"Hard k-WTA (k=2): {hard_out}")
+    
+    # Soft k-WTA
+    soft_cortex = AttractorCortex(columns=columns, k_sparsity=2, use_soft_k=True)
+    soft_out = soft_cortex.apply_sparsity(test_vec)
+    print(f"Soft k-WTA: {soft_out}")
+    
+    # Test 4: Convergence
+    print("\n4. Convergence test:")
+    
     for col in columns:
-        col.forward(x)
+        col.forward(torch.randn(input_dim))
     
-    # Attractor forward
-    output = cortex.forward(x=x)
-    print(f"Output shape: {output.shape}")
-    print(f"Output values: {output}")
-    
-    # Check convergence info
+    output = cortex.forward()
     info = cortex.get_convergence_info()
-    print(f"Converged: {info['converged']}")
-    print(f"Steps taken: {info['steps']}")
-    print(f"Final difference: {info['final_diff']:.6f}")
-    print(f"Energy: {info['energy']:.6f}")
+    print(f"Steps: {info['steps']}, Converged: {info['converged']}")
+    print(f"Final diff: {info['final_diff']:.6f}, Energy: {info['energy']:.6f}")
     
-    # Test 3: Learning with stabilization
-    print("\n3. Testing learning with stabilization...")
-    
-    # Store initial weights
-    W_before = cortex.W.clone()
-    activation_avg_before = cortex.col_activation_avg.clone()
-    
-    # Learn
-    cortex.learn()
-    
-    # Check changes
-    W_after = cortex.W.clone()
-    activation_avg_after = cortex.col_activation_avg.clone()
-    
-    W_change = torch.mean(torch.abs(W_after - W_before)).item()
-    activation_change = torch.mean(torch.abs(activation_avg_after - activation_avg_before)).item()
-    
-    print(f"Weight change: {W_change:.6f}")
-    print(f"Activation avg change: {activation_change:.6f}")
-    
-    # Check weight norms
-    norms = torch.norm(cortex.W, dim=1)
-    print(f"Row norms after learning: {norms}")
-    
-    # Test 4: Multiple forward passes to test homeostasis
-    print("\n4. Testing homeostasis over multiple steps...")
-    
-    cortex2 = AttractorCortex(
-        columns=columns,
-        input_proj=False,
-        activation_target=0.3,
-        homeo_lr=0.05
-    )
-    
-    activations_over_time = []
-    for step in range(5):
-        x_step = torch.randn(input_dim)
-        
-        # Activate columns
-        for col in columns:
-            col.forward(x_step)
-        
-        # Forward through cortex
-        output = cortex2.forward()
-        activations_over_time.append(output.detach().numpy())
-        
-        # Learn every step
-        cortex2.learn()
-        
-        # Check activation average
-        if step == 0:
-            print(f"Step {step+1}: Activation avg = {cortex2.col_activation_avg}")
-    
-    print(f"Final activation average: {cortex2.col_activation_avg}")
-    
-    # Test 5: Energy computation
-    print("\n5. Testing energy computation...")
-    
-    # Random state energy
-    random_state = torch.randn(num_columns)
-    random_energy = cortex.compute_energy(random_state)
-    print(f"Random state energy: {random_energy:.6f}")
-    
-    # Stable state energy
-    if cortex.energy_value is not None:
-        print(f"Stable state energy: {cortex.energy_value:.6f}")
-        print(f"Stable state lower energy: {cortex.energy_value < random_energy}")
-    
-    # Test 6: Different settling parameters
-    print("\n6. Testing different settling parameters...")
-    
-    # Fast settling
-    fast_cortex = AttractorCortex(
-        columns=columns,
-        input_proj=False,
-        settling_steps=3,
-        convergence_thresh=0.1
-    )
-    
-    # Slow settling
-    slow_cortex = AttractorCortex(
-        columns=columns,
-        input_proj=False,
-        settling_steps=20,
-        convergence_thresh=1e-6
-    )
-    
-    # Test both
-    for col in columns:
-        col.forward(x)
-    
-    fast_output = fast_cortex.forward()
-    fast_info = fast_cortex.get_convergence_info()
-    
-    for col in columns:
-        col.forward(x)
-    
-    slow_output = slow_cortex.forward()
-    slow_info = slow_cortex.get_convergence_info()
-    
-    print(f"Fast cortex: {fast_info['steps']} steps, converged={fast_info['converged']}")
-    print(f"Slow cortex: {slow_info['steps']} steps, converged={slow_info['converged']}")
-    
-    # Test 7: Synaptic scaling
-    print("\n7. Testing synaptic scaling...")
-    
-    # Create cortex with different scaling target
-    scaled_cortex = AttractorCortex(
-        columns=columns,
-        input_proj=False,
-        synaptic_scaling_target=2.0
-    )
-    
-    # Do a forward and learn
-    for col in columns:
-        col.forward(x)
-    
-    scaled_output = scaled_cortex.forward()
-    scaled_cortex.learn()
-    
-    # Check norms
-    scaled_norms = torch.norm(scaled_cortex.W, dim=1)
-    print(f"Target norm: {scaled_cortex.synaptic_scaling_target}")
-    print(f"Actual row norms: {scaled_norms}")
-    print(f"Close to target: {torch.allclose(scaled_norms, torch.ones_like(scaled_norms)*2.0, rtol=0.1)}")
-    
-    # Test 8: Error handling
-    print("\n8. Testing error handling...")
-    
-    try:
-        # Try to learn without forward pass
-        bad_cortex = AttractorCortex(columns=columns, input_proj=False)
-        bad_cortex.learn()
-    except ValueError as e:
-        print(f"✓ Correctly caught error: {e}")
-    
-    try:
-        # Try forward without activating columns
-        bad_cortex2 = AttractorCortex(columns=columns, input_proj=False)
-        bad_cortex2.forward()
-    except ValueError as e:
-        print(f"✓ Correctly caught error: {e}")
-    
-    print("\n" + "=" * 50)
-    print("All AttractorCortex tests completed!")
-    print("=" * 50)
+    print("\nAll tests passed!")

@@ -2,8 +2,8 @@ import torch
 from phase_one_layers_neurons import ProtoLayer
 
 class ProtoColumn:
-    def __init__( self,input_size: int,num_neurons: int = 5,lr: float = 0.01,inhibition_strength: float = 0.2, cooperation_strength: float = 0.1,trace_decay: float = 0.9):
-        self.layer = ProtoLayer(input_size=input_size,lr=lr,num_neurons=num_neurons)
+    def __init__( self,input_size: int,num_neurons: int = 5,lr: float = 0.01,inhibition_strength: float = 0.2, cooperation_strength: float = 0.1,trace_decay: float = 0.9,elig_decay: float = 0.9):
+        self.layer = ProtoLayer(input_size=input_size,lr=lr,num_neurons=num_neurons,elig_decay=elig_decay)
         # Dynamics parameters
         self.inhibition_strength = inhibition_strength
         self.cooperation_strength = cooperation_strength
@@ -13,6 +13,8 @@ class ProtoColumn:
         # Internal memory
         self.last_output = None
         self.last_act = None
+        # Column-level plasticity gate
+        self.plasticity_gate = 1.0
 
     def forward(self,x):
         """
@@ -38,204 +40,279 @@ class ProtoColumn:
         self.last_output=normalized
         return normalized
     
-    def learn(self, target):
+    def learn(self, target=None, delta=None, gate: float = 1.0,mix_local: float = 0.5):
         """
         Column learning rule:
+        Args:
+            target: Target vector for supervised learning
+            delta: Dopamine signal (RPE)
+            gate: External plasticity gate
+            mix_local: Blend between local and DA learning
         """
-        # Bias target using column state
-        mod_target = target + 0.05 * self.column_trace
-        for neuron in self.layer.neurons:
-            neuron.learn(mod_target)
-
+        # Combine column gate with external gate
+        effective_gate = gate * self.plasticity_gate
+        
+        # Modulate target with column trace
+        mod_target = None
+        if target is not None:
+            mod_target = target + 0.05 * self.column_trace
+        # Pass to layer
+        self.layer.learn(target=mod_target, delta=delta,gate=effective_gate, mix_local=mix_local)
 
 if __name__ == "__main__":
+    print("Testing ProtoColumn with Modulated Learning...")
+    print("=" * 60)
+    
+    torch.manual_seed(42)
+    
     # Test 1: Basic initialization and forward pass
-    print("Test 1: Basic initialization and forward pass")
-    print("-" * 50)
+    print("\n1. Testing initialization and forward pass...")
     
     input_size = 10
-    num_neurons = 5
-    column = ProtoColumn(input_size=input_size, num_neurons=num_neurons)
+    num_neurons = 6
+    column = ProtoColumn(
+        input_size=input_size,
+        num_neurons=num_neurons,
+        lr=0.01,
+        inhibition_strength=0.2,
+        cooperation_strength=0.1,
+        trace_decay=0.9,
+        elig_decay=0.9
+    )
     
-    # Create a random input
+    print(f"Column created with {num_neurons} neurons")
+    print(f"Inhibition strength: {column.inhibition_strength}")
+    print(f"Cooperation strength: {column.cooperation_strength}")
+    print(f"Trace decay: {column.gamma}")
+    print(f"Layer input size: {column.layer.input_size}")
+    print(f"Layer neurons: {len(column.layer.neurons)}")
+    
+    # Test forward pass
     x = torch.randn(input_size)
-    print(f"Input shape: {x.shape}")
-    
-    # Forward pass
     output = column.forward(x)
+    
+    print(f"\nInput shape: {x.shape}")
     print(f"Output shape: {output.shape}")
-    print(f"Output values: {output}")
     print(f"Output range: [{output.min():.4f}, {output.max():.4f}]")
+    print(f"Output max abs close to 1: {torch.abs(output).max() > 0.9}")
+    print(f"Column trace: {column.column_trace.item():.4f}")
     
-    # Check normalization
-    print(f"Is normalized (max close to 1): {torch.abs(output.max()) > 0.9}")
+    # Test 2: Inhibition effects
+    print("\n2. Testing inhibition effects...")
     
-    # Test 2: Trace dynamics
-    print("\nTest 2: Trace dynamics")
-    print("-" * 50)
-    
-    # Multiple forward passes to see trace accumulation
-    column2 = ProtoColumn(input_size=input_size, num_neurons=num_neurons, trace_decay=0.5)
-    trace_values = []
-    
-    for i in range(5):
-        x = torch.randn(input_size)
-        output = column2.forward(x)
-        trace_values.append(column2.column_trace.item())
-        print(f"Step {i+1}: Trace = {column2.column_trace.item():.4f}, Mean output = {output.mean():.4f}")
-    
-    # Test 3: Learning - FIXED VERSION
-    print("\nTest 3: Learning")
-    print("-" * 50)
-    
-    column3 = ProtoColumn(input_size=input_size, num_neurons=num_neurons, lr=0.1)
-    
-    # Store initial weights for comparison
-    initial_weights = []
-    for neuron in column3.layer.neurons:
-        initial_weights.append(neuron.weights.clone())
-    
-    # Forward pass
-    x = torch.randn(input_size)
-    output = column3.forward(x)
-    print(f"Before learning - Output: {output}")
-    
-    # IMPORTANT FIX: Each neuron needs its own error signal
-    # The column output is [neuron1_output, neuron2_output, ...]
-    # We need error_i for each neuron i
-    target = torch.randn(num_neurons)  # Target for each neuron
-    print(f"Target: {target}")
-    
-    # Calculate error per neuron
-    errors = target - output
-    print(f"Errors per neuron: {errors}")
-    
-    # Learn - each neuron gets its own error
-    for i, neuron in enumerate(column3.layer.neurons):
-        # Extract the error for this specific neuron
-        neuron_error = errors[i].item()  # Convert to scalar
-        neuron.learn(neuron_error)
-    
-    # Alternative: Use the column's learn method but it needs to be fixed
-    # For now, use the manual approach above
-    
-    # Forward pass with same input after learning
-    output_after = column3.forward(x)
-    print(f"After learning - Output: {output_after}")
-    
-    # Check if weights changed
-    weight_changed = False
-    for i, neuron in enumerate(column3.layer.neurons):
-        if not torch.allclose(neuron.weights, initial_weights[i], rtol=1e-5):
-            weight_changed = True
-            print(f"Neuron {i} weights changed")
-            break
-    print(f"Weights changed: {weight_changed}")
-    
-    # Test 4: Test the actual column.learn() method
-    print("\nTest 4: Testing column.learn() method")
-    print("-" * 50)
-    
-    column4 = ProtoColumn(input_size=input_size, num_neurons=num_neurons, lr=0.01)
-    
-    # Forward pass
-    x = torch.randn(input_size)
-    output_before = column4.forward(x)
-    
-    # Create target and use column.learn()
-    target = torch.randn(num_neurons)
-    
-    try:
-        column4.learn(target)
-        print("column.learn() executed successfully")
-        
-        # Check if it modified the trace properly
-        print(f"Column trace after learning: {column4.column_trace.item():.4f}")
-        
-    except Exception as e:
-        print(f"Error in column.learn(): {e}")
-        print("This suggests the neuron.learn() method expects a scalar, not a vector")
-    
-    # Test 5: Inhibition and cooperation effects
-    print("\nTest 5: Inhibition and cooperation effects")
-    print("-" * 50)
-    
-    # Test with different inhibition strengths
     for inhibition in [0.0, 0.2, 0.5, 1.0]:
-        column_test = ProtoColumn(
-            input_size=input_size, 
+        test_col = ProtoColumn(
+            input_size=input_size,
             num_neurons=num_neurons,
             inhibition_strength=inhibition,
-            cooperation_strength=0.0  # Turn off cooperation for this test
+            cooperation_strength=0.0
         )
         
-        x = torch.randn(input_size)
-        act = column_test.layer.forward(x)  # Get raw activations
-        output = column_test.forward(x)     # Get after inhibition
+        test_output = test_col.forward(x)
+        std_dev = torch.std(test_output).item()
+        active_neurons = (torch.abs(test_output) > 0.1).sum().item()
         
-        # Calculate spread (standard deviation) to see inhibition effect
-        act_spread = torch.std(act).item()
-        out_spread = torch.std(output).item()
-        
-        print(f"Inhibition={inhibition:.1f}: Raw spread={act_spread:.4f}, After inhibition={out_spread:.4f}")
+        print(f"Inhibition={inhibition:.1f}: std={std_dev:.4f}, active={active_neurons}/{num_neurons}")
     
-    # Test 6: Cooperation effects
-    print("\nTest 6: Cooperation effects")
-    print("-" * 50)
+    # Test 3: Cooperation effects
+    print("\n3. Testing cooperation effects...")
     
     for cooperation in [0.0, 0.1, 0.5]:
-        column_test = ProtoColumn(
-            input_size=input_size, 
+        test_col = ProtoColumn(
+            input_size=input_size,
             num_neurons=num_neurons,
-            inhibition_strength=0.0,  # Turn off inhibition for this test
+            inhibition_strength=0.0,
             cooperation_strength=cooperation
         )
         
-        x = torch.randn(input_size)
-        act = column_test.layer.forward(x)  # Get raw activations
-        output = column_test.forward(x)     # Get after cooperation
+        test_output = test_col.forward(x)
+        mean_val = torch.mean(test_output).item()
         
-        # Calculate mean activation
-        act_mean = torch.mean(act).item()
-        out_mean = torch.mean(output).item()
+        print(f"Cooperation={cooperation:.1f}: mean={mean_val:.4f}")
+    
+    # Test 4: Trace dynamics
+    print("\n4. Testing trace dynamics...")
+    
+    trace_col = ProtoColumn(
+        input_size=input_size,
+        num_neurons=num_neurons,
+        trace_decay=0.5  # Fast decay for testing
+    )
+    
+    trace_values = []
+    for step in range(5):
+        x_step = torch.randn(input_size)
+        output_step = trace_col.forward(x_step)
+        trace_values.append(trace_col.column_trace.item())
+        print(f"Step {step+1}: trace={trace_col.column_trace.item():.4f}, mean={output_step.mean():.4f}")
+    
+    # Test 5: Learning without dopamine (local only)
+    print("\n5. Testing learning without dopamine...")
+    
+    col_local = ProtoColumn(input_size=input_size, num_neurons=num_neurons)
+    
+    # Store initial weights
+    initial_weights = []
+    for neuron in col_local.layer.neurons:
+        initial_weights.append(neuron.weights.clone())
+    
+    # Forward
+    x_local = torch.randn(input_size)
+    output_local = col_local.forward(x_local)
+    
+    # Learn with target only
+    target = torch.randn(num_neurons)
+    col_local.learn(target=target, delta=None, gate=1.0, mix_local=1.0)
+    
+    # Check if weights changed
+    weights_changed = False
+    for i, neuron in enumerate(col_local.layer.neurons):
+        if not torch.allclose(neuron.weights, initial_weights[i], rtol=1e-5):
+            weights_changed = True
+            break
+    
+    print(f"Local learning weights changed: {weights_changed}")
+    
+    # Test 6: Learning with dopamine only
+    print("\n6. Testing learning with dopamine only...")
+    
+    col_da = ProtoColumn(input_size=input_size, num_neurons=num_neurons)
+    
+    # Store initial weights
+    initial_weights_da = []
+    for neuron in col_da.layer.neurons:
+        initial_weights_da.append(neuron.weights.clone())
+    
+    # Forward
+    x_da = torch.randn(input_size)
+    output_da = col_da.forward(x_da)
+    
+    # Learn with dopamine only
+    delta = 0.3
+    col_da.learn(target=None, delta=delta, gate=1.0, mix_local=0.0)
+    
+    # Check if weights changed
+    weights_changed_da = False
+    for i, neuron in enumerate(col_da.layer.neurons):
+        if not torch.allclose(neuron.weights, initial_weights_da[i], rtol=1e-5):
+            weights_changed_da = True
+            break
+    
+    print(f"Dopamine learning weights changed: {weights_changed_da}")
+    
+    # Test 7: Mixed learning
+    print("\n7. Testing mixed learning...")
+    
+    col_mixed = ProtoColumn(input_size=input_size, num_neurons=num_neurons)
+    
+    # Store initial weights
+    initial_weights_mixed = []
+    for neuron in col_mixed.layer.neurons:
+        initial_weights_mixed.append(neuron.weights.clone())
+    
+    # Forward
+    x_mixed = torch.randn(input_size)
+    output_mixed = col_mixed.forward(x_mixed)
+    
+    # Learn with both
+    target_mixed = torch.randn(num_neurons)
+    delta_mixed = 0.2
+    col_mixed.learn(target=target_mixed, delta=delta_mixed, gate=0.8, mix_local=0.5)
+    
+    # Check if weights changed
+    weights_changed_mixed = False
+    for i, neuron in enumerate(col_mixed.layer.neurons):
+        if not torch.allclose(neuron.weights, initial_weights_mixed[i], rtol=1e-5):
+            weights_changed_mixed = True
+            break
+    
+    print(f"Mixed learning weights changed: {weights_changed_mixed}")
+    
+    # Test 8: Trace-modulated target
+    print("\n8. Testing trace-modulated target...")
+    
+    col_trace = ProtoColumn(
+        input_size=input_size,
+        num_neurons=num_neurons,
+        trace_decay=0.9
+    )
+    
+    # Build up trace
+    for _ in range(3):
+        x_trace = torch.randn(input_size)
+        col_trace.forward(x_trace)
+    
+    trace_value = col_trace.column_trace.item()
+    print(f"Column trace before learning: {trace_value:.4f}")
+    
+    target_original = torch.randn(num_neurons)
+    col_trace.learn(target=target_original, delta=None, gate=1.0, mix_local=1.0)
+    
+    print(f"Trace used to modulate target (+0.05*trace)")
+    
+    # Test 9: Plasticity gate
+    print("\n9. Testing plasticity gate...")
+    
+    col_gated = ProtoColumn(input_size=input_size, num_neurons=num_neurons)
+    col_gated.plasticity_gate = 0.3  # Reduce plasticity
+    
+    # Store initial weights
+    initial_weights_gated = []
+    for neuron in col_gated.layer.neurons:
+        initial_weights_gated.append(neuron.weights.clone())
+    
+    # Forward
+    x_gated = torch.randn(input_size)
+    col_gated.forward(x_gated)
+    
+    # Learn with external gate
+    col_gated.learn(target=torch.randn(num_neurons), delta=0.1, gate=0.5, mix_local=0.5)
+    
+    # Check weight changes
+    weight_changes = []
+    for i, neuron in enumerate(col_gated.layer.neurons):
+        change = torch.norm(neuron.weights - initial_weights_gated[i]).item()
+        weight_changes.append(change)
+    
+    avg_change = sum(weight_changes) / len(weight_changes)
+    print(f"Average weight change with effective gate=0.15: {avg_change:.6f}")
+    
+    # Test 10: Multiple forward-learn cycles
+    print("\n10. Testing multiple forward-learn cycles...")
+    
+    col_seq = ProtoColumn(input_size=input_size, num_neurons=num_neurons)
+    outputs_history = []
+    
+    for step in range(5):
+        x_seq = torch.randn(input_size)
+        output_seq = col_seq.forward(x_seq)
+        outputs_history.append(output_seq.detach().numpy())
         
-        print(f"Cooperation={cooperation:.1f}: Raw mean={act_mean:.4f}, After cooperation={out_mean:.4f}")
-    
-    # Test 7: Batch processing test
-    print("\nTest 7: Batch processing")
-    print("-" * 50)
-    
-    batch_size = 3
-    column_batch = ProtoColumn(input_size=input_size, num_neurons=num_neurons)
-    
-    batch_input = torch.randn(batch_size, input_size)
-    batch_output = []
-    
-    for i in range(batch_size):
-        output = column_batch.forward(batch_input[i])
-        batch_output.append(output)
-        print(f"Batch item {i}: output shape = {output.shape}")
-    
-    batch_tensor = torch.stack(batch_output)
-    print(f"Batch output tensor shape: {batch_tensor.shape}")
-    
-    # Test 8: Edge cases
-    print("\nTest 8: Edge cases")
-    print("-" * 50)
-    
-    # Zero input
-    x_zero = torch.zeros(input_size)
-    column_zero = ProtoColumn(input_size=input_size, num_neurons=num_neurons)
-    output_zero = column_zero.forward(x_zero)
-    print(f"Zero input - Output: {output_zero}")
-    print(f"Zero input - All zeros: {torch.all(output_zero == 0)}")
-    print(f"Zero input - Column trace: {column_zero.column_trace.item():.4f}")
-    
-    # Very large input
-    x_large = torch.ones(input_size) * 100
-    output_large = column_zero.forward(x_large)
-    print(f"\nLarge input - Output range: [{output_large.min():.4f}, {output_large.max():.4f}]")
-    print(f"Large input - Max close to 1: {torch.abs(output_large.max()) > 0.99}")
-    
-    print("\nAll tests completed!") 
+        # Alternate learning modes
+        if step % 2 == 0:
+            # Local learning
+            col_seq.learn(target=torch.randn(num_neurons), delta=None, mix_local=1.0)
+        else:
+            # Dopamine learning
+            col_seq.learn(delta=0.1, mix_local=0.0)
         
+        print(f"Step {step+1}: output mean={output_seq.mean():.4f}, trace={col_seq.column_trace.item():.4f}")
+    
+    print(f"Sequence length: {len(outputs_history)} steps")
+    
+    # Test 11: Error cases
+    print("\n11. Testing error cases...")
+    
+    # Should work fine
+    try:
+        col_test = ProtoColumn(input_size=5, num_neurons=3)
+        x_test = torch.randn(5)
+        col_test.forward(x_test)
+        col_test.learn(target=torch.randn(3))
+        print("✓ Normal operation successful")
+    except Exception as e:
+        print(f"✗ Unexpected error: {e}")
+    
+    print("\n" + "=" * 60)
+    print("All ProtoColumn tests completed!")
+    print("=" * 60)

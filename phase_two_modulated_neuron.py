@@ -1,5 +1,5 @@
 import torch
-class ModProtoNeuron:
+class ProtoNeuronMod:
     def __init__(self, input_size: int, learning_rate: float = 0.01,decay: float = 0.9, init_scale: float = 0.1,elig_decay: float = 0.9, local_lr: float = 0.01):
         self.input_size = input_size
         self.learning_rate = learning_rate  # for DA updates
@@ -28,9 +28,9 @@ class ModProtoNeuron:
         a=torch.tanh(z)
         self.trace=self.gamma *self.trace + a
         self.last_activation = a
-        
         # Update eligibility trace: e ← λ_e * e + a * x
         self.eligibility = self.elig_decay * self.eligibility + (a * x) 
+        return a
 
     def learn(self, target=None, delta=None, gate: float = 1.0, mix_local: float = 0.5): 
         """
@@ -72,3 +72,21 @@ class ModProtoNeuron:
         """Reset eligibility trace."""
         self.eligibility = torch.zeros_like(self.weights)     
 
+# Quick test
+if __name__ == "__main__":
+    print("Quick test of ProtoNeuronMod...")
+    
+    # Create neuron
+    neuron = ProtoNeuronMod(input_size=5)
+    
+    # Test forward
+    x = torch.randn(5)
+    activation = neuron.forward(x)
+    
+    print(f"Activation type: {type(activation)}")
+    print(f"Activation value: {activation}")
+    print(f"Is tensor: {isinstance(activation, torch.Tensor)}")
+    
+    # Test learning
+    neuron.learn(target=0.5, delta=0.2)
+    print("Learning successful!")
