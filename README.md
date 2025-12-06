@@ -232,3 +232,8 @@ V(t+1) = V(t) + α*δ(t) # Value update
 ### Prerequisites:
 ```bash
 pip install torch numpy matplotlib
+```
+
+```bash
+python phase_one_life_loop.py
+```
