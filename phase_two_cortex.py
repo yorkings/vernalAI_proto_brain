@@ -1,16 +1,23 @@
 import torch
 from phase_two_column import ProtoColumn
 from typing import List,Callable
+from phase_two_GWI import GlobalWorkspace
 
 class CorticalBlock:
     def __init__(self ,columns: List[ProtoColumn],input_proj: bool = False,rho: float = 0.2, eta: float = 1e-3,weight_decay: float = 1e-4, init_scale: float = 0.02,
-        reduce_fn: Callable = lambda v: v.mean(),elig_decay: float = 0.9):
+        reduce_fn: Callable = lambda v: v.mean(),elig_decay: float = 0.9, gwi_threshold: float = 0.6):
         self.columns = columns
         self.C = len(columns)
         self.reduce_fn = reduce_fn  # how to reduce column vector -> scalar
         self.rho = rho
         self.eta = eta
         self.weight_decay = weight_decay
+
+        # Get hidden dimension from first column
+        self.hidden_dim = columns[0].layer.num_neurons if hasattr(columns[0].layer, 'num_neurons') else 5
+         # Initialize Global Workspace
+        self.workspace = GlobalWorkspace(hidden_dim=self.hidden_dim,num_columns=self.C,threshold=gwi_threshold)
+
         # recurrent state (pre-activation)
         self.z = torch.zeros(self.C)
         # inter-column weights W (C x C)
@@ -42,6 +49,9 @@ class CorticalBlock:
         """
         #summary
         o=torch.zeros(self.C)
+        column_outputs = []
+        column_traces = []
+
         for i,col in enumerate(self.columns):
             col_vec=col.last_output
             o[i]=float(self.reduce_fn(col_vec))
@@ -58,6 +68,12 @@ class CorticalBlock:
 
         self.last_o = out.clone()
         self.last_raw_o = o.clone()
+
+        # Check for Global Workspace Ignition using column outputs
+        if column_outputs:
+            gwi_result = self.workspace(column_outputs, column_traces)
+            self.last_ignition = gwi_result
+        
         return out
     
     def learn(self,delta=None, gate: float = 1.0, mix_local: float = 0.5):

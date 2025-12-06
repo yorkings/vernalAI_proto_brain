@@ -1,8 +1,9 @@
 import torch
 from phase_one_layers_neurons import ProtoLayer
-
+import random
 class ProtoColumn:
-    def __init__( self,input_size: int,num_neurons: int = 5,lr: float = 0.01,inhibition_strength: float = 0.2, cooperation_strength: float = 0.1,trace_decay: float = 0.9,elig_decay: float = 0.9):
+    def __init__( self,input_size: int,num_neurons: int = 5,lr: float = 0.01,inhibition_strength: float = 0.2, cooperation_strength: float = 0.1,
+                 trace_decay: float = 0.9,elig_decay: float = 0.9,gamma_per_theta:int=8):
         self.layer = ProtoLayer(input_size=input_size,lr=lr,num_neurons=num_neurons,elig_decay=elig_decay)
         # Dynamics parameters
         self.inhibition_strength = inhibition_strength
@@ -13,6 +14,7 @@ class ProtoColumn:
         # Internal memory
         self.last_output = None
         self.last_act = None
+        self.preferred_gamma_bin = random.randint(0, gamma_per_theta-1)
         # Column-level plasticity gate
         self.plasticity_gate = 1.0
 
