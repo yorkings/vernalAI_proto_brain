@@ -2,7 +2,9 @@ import torch
 from phase_two_column import ProtoColumn
 from phase_two_cortex import CorticalBlock  # Import the CorticalBlock
 from phase_two_rhythm_engine import RhythmEngine
-from typing import List,Callable,Optional
+from typing import List,Callable,Optional,Dict
+from phase_two_last import EpisodeBuffer,EpisodeStep,Episode
+from phase_two_reward import RewardModule
 
 import math
 
@@ -11,7 +13,10 @@ class AttractorCortex(CorticalBlock):  # Extend CorticalBlock
                  reduce_fn: Callable = lambda v: v.mean(), settling_steps: int = 5, energy_weight: float = 0.01, convergence_thresh: float = 1e-4,
                  activation_target=0.2,homeo_lr = 0.01,synaptic_scaling_target = 1.0,
                  k_sparsity = 2,inhibition_strength = 1.0,beta_soft = 20,use_soft_k = False,
-                 rhythm:Optional[RhythmEngine]=None
+                 rhythm:Optional[RhythmEngine]=None,
+                 #episodic memmory
+                 buffer_capacity: int = 200, max_episode_length: int = 10,immediate_replay_threshold: float = 0.2, background_replay_batch: int = 2,priority_decay: float = 0.05,
+                  value_lr: float = 0.01, baseline_reward: float = 0.0
                   ):
         # Initialize parent CorticalBlock
         super().__init__(columns, input_proj, rho, eta, weight_decay,init_scale, reduce_fn)
@@ -48,16 +53,66 @@ class AttractorCortex(CorticalBlock):  # Extend CorticalBlock
         self.last_state = None
         self.last_pred = None
         self.last_error = None
-        self.last_surprise = None
+        self.last_surprise = 0.0
         #rhythm
         self.rhythm = rhythm
         if rhythm is not None:
             for col in self.columns:
                 col.preferred_gamma_bin= torch.randint(low=0,high=rhythm.gamma_per_theta, size=(1,)).item()
-
+        # ========== REWARD MODULE (Phase 2.4) ==========
+        self.reward_module = RewardModule(value_lr=value_lr, baseline=baseline_reward)
+        self.last_raw_reward = 0.0  # Store the raw reward before RPE calculation
+        self.last_dopamine_signal = 0.0  # Store the dopamine (RPE) signal        
+         # ========== EPISODIC MEMORY ADDITIONS (Phase 2.10) ==========
+        self.buffer_capacity = buffer_capacity
+        self.max_episode_length = max_episode_length
+        self.immediate_replay_threshold = immediate_replay_threshold
+        self.background_replay_batch = background_replay_batch
+        self.priority_decay = priority_decay
+        
+        # Episode buffer
+        self.episode_buffer = EpisodeBuffer(capacity=buffer_capacity)
+        
+        # Current episode being recorded
+        self.current_episode: Optional[Episode] = None
+        self.current_episode_length = 0
+        self.episode_start_time = 0
+        
+        # Global timestep counter
+        self.global_timestep = 0
+        
+        # Replay mode flag
+        self.replay_mode = False
+        
+        # Statistics
+        self.memory_stats = {
+            'episodes_recorded': 0,
+            'steps_recorded': 0,
+            'immediate_replays': 0,
+            'background_replays': 0,
+            'total_replay_steps': 0
+        }
+                
         # Replay memory
         self.replay_memory = []
-        self.max_replay_length = 50        
+        self.max_replay_length = 50   
+        # For tracking reward/surprise
+        self.last_reward = 0.0
+        self.last_prediction_error = 0.0  
+
+    def process_reward(self, raw_reward: float) -> float:
+        """
+        Process reward through RewardModule to get dopamine signal (RPE).
+        
+        Args:
+            raw_reward: The observed reward from environment
+            
+        Returns:
+            dopamine_signal: Reward Prediction Error (δ = r - V)
+        """
+        self.last_raw_reward = raw_reward
+        self.last_dopamine_signal = self.reward_module.step(raw_reward)
+        return self.last_dopamine_signal       
 
     def predict_next(self, o: torch.Tensor) -> torch.Tensor:
         """Predict next state: ô_{t+1} = normalize(W_temp @ o_t)."""
@@ -72,8 +127,11 @@ class AttractorCortex(CorticalBlock):  # Extend CorticalBlock
         regularization = self.energy_weight * torch.sum(o**2)
         return (recurrent_energy + regularization).item()
     
-    def forward(self, x: torch.Tensor = None) -> torch.Tensor:
-        """Forward pass with attractor settling and temporal prediction."""
+    def forward(self, x: torch.Tensor = None,replay_mode: bool = False) -> torch.Tensor:
+        """Forward pass with attractor settling, temporal prediction, AND episode recording"""
+         # Set replay mode
+        self.replay_mode = replay_mode
+
         # 1. Update columns if x provided
         if x is not None:
             for col in self.columns:
@@ -137,7 +195,99 @@ class AttractorCortex(CorticalBlock):  # Extend CorticalBlock
         # Temporal prediction for next timestep
         self.last_pred = self.predict_next(o)
         self.last_state = o.clone()
+
+        if not self.replay_mode and x is not None:
+            self._record_step(x, o)
+
         return o
+    
+    def _record_step(self, x: torch.Tensor, attractor_state: torch.Tensor):
+        """Record current step in episode"""
+        print(f"[DEBUG] Storing reward: last_reward={self.last_reward}, last_raw_reward={self.last_raw_reward}")
+        # Start new episode if needed
+        if self.current_episode is None:
+            self.current_episode = Episode(start_timestamp=self.global_timestep)
+            self.current_episode_length = 0
+            self.episode_start_time = self.global_timestep     
+        # Get column states
+        column_states = torch.cat([col.last_output for col in self.columns])
+        # Create step - ensure last_surprise is not None
+        current_surprise = self.last_surprise if self.last_surprise is not None else 0.0
+        current_pred_error = self.last_prediction_error if self.last_prediction_error is not None else 0.0
+        # Create step
+        step = EpisodeStep(timestamp=self.global_timestep,input_vector=x,column_states=column_states,attractor_state=attractor_state,reward=self.last_raw_reward,
+                           surprise=self.last_surprise,pred_error=self.last_prediction_error)
+        # Add to current episode
+        self.current_episode.add_step(step)
+        self.current_episode_length += 1
+        self.global_timestep += 1 
+        self.memory_stats['steps_recorded'] += 1
+        # Check if episode should end
+        should_end = (self.current_episode_length >= self.max_episode_length or   abs(self.last_reward) > 2.0 or  # Large reward event
+            (self.last_surprise is not None and self.last_surprise > 0.5)  # High surprise
+        )
+        if should_end:
+            self._finish_current_episode()
+            
+    def _finish_current_episode(self):
+        """Finish and store current episode"""
+        if self.current_episode is None or self.current_episode_length == 0:
+            return    
+        # Finalize episode
+        self.current_episode.finalize(current_time=self.global_timestep) 
+        # Add to buffer
+        needs_immediate = self.episode_buffer.add_episode(self.current_episode)
+        # Immediate replay if needed
+        if needs_immediate:
+            self._execute_immediate_replay(self.current_episode)      
+        # Update statistics
+        self.memory_stats['episodes_recorded'] += 1
+        # Reset for next episode
+        self.current_episode = None
+        self.current_episode_length = 0
+        
+    def _execute_immediate_replay(self, episode: Episode):
+        """Execute immediate replay of high-priority episode"""
+        replay_count = self.episode_buffer.compute_replay_count(episode)
+        # Execute reverse replay
+        for _ in range(replay_count):
+            steps = episode.get_steps_reversed()
+            for step in steps:
+                # Add small noise for generalization
+                noisy_input = step.input_vector + torch.randn_like(step.input_vector) * 0.01  
+                # Replay forward pass
+                self.forward(x=noisy_input, replay_mode=True)
+            # Learn from replay
+            da_signal = episode.get_aggregate_dopamine()
+            self.learn(da_signal=da_signal * 0.5)  # Weaker learning for replay
+            self.memory_stats['total_replay_steps'] += len(steps)    
+        # Decay priority
+        episode.decay_priority(mu=self.priority_decay)
+        self.memory_stats['immediate_replays'] += 1
+        
+    def execute_background_replay(self):
+        """Execute background replay during theta windows"""
+        if (self.replay_mode or len(self.episode_buffer.buffer) == 0 or (self.rhythm and not self.rhythm.theta_in_window())):
+            return
+        # Sample episodes for background replay
+        episodes = self.episode_buffer.sample(k=self.background_replay_batch)
+        for episode in episodes:
+            replay_count = self.episode_buffer.compute_replay_count(episode)
+            # Execute replay
+            for _ in range(replay_count):
+                steps = episode.get_steps_reversed()
+                for step in steps:
+                    # Add smaller noise for background replay
+                    noisy_input = step.input_vector + torch.randn_like(step.input_vector) * 0.005
+                    # Replay forward pass
+                    self.forward(x=noisy_input, replay_mode=True)
+                # Learn from replay with weak dopamine
+                da_signal = episode.get_aggregate_dopamine()
+                self.learn(da_signal=da_signal * 0.3)
+                self.memory_stats['total_replay_steps'] += len(steps)   
+            # Decay priority
+            episode.decay_priority(mu=self.priority_decay * 0.5)  # Slower decay for background
+            self.memory_stats['background_replays'] += 1
         
     #the three fuctions are for providing stability
     def homeostasis_update(self, o):
@@ -181,9 +331,15 @@ class AttractorCortex(CorticalBlock):  # Extend CorticalBlock
 
     def learn(self,da_signal: float = 1.0) -> None:
         """
+        Enhanced learn method that tracks surprise for episode recording
         Learn using Oja's rule with energy regularization.   
         Update rule: ΔW = η * (o o^T - energy_weight * W)
         """
+        # Store prediction error as surprise metric
+        if self.last_error is not None:
+            self.last_surprise = torch.norm(self.last_error, p=1).item()
+            self.last_prediction_error = self.last_surprise
+
         if self.rhythm and not self.rhythm.theta_in_window():
             return 
         if self.stable_state is None:
@@ -208,6 +364,26 @@ class AttractorCortex(CorticalBlock):  # Extend CorticalBlock
         self.homeostasis_update(o)
         self.synaptic_scaling()
         self.normalize_recurrent_weights()
+
+  
+    def get_memory_statistics(self) -> Dict:
+        """Get episodic memory statistics"""
+        return {
+            **self.memory_stats,
+            'buffer_size': len(self.episode_buffer.buffer),
+            'current_episode_length': self.current_episode_length,
+            'global_timestep': self.global_timestep
+        }
+        
+    def reset_memory(self):
+        """Reset episodic memory (keep buffer)"""
+        self.current_episode = None
+        self.current_episode_length = 0
+        self.global_timestep = 0
+        self.replay_mode = False
+        self.last_reward = 0.0
+        self.last_prediction_error = 0.0   
+        self.reward_module.reset()  
 
     def learn_temporal(self, next_state: torch.Tensor,da_signal: float = 1.0):
         """Learn temporal transitions: ΔW_temp = η_temp*(o_t @ o_{t+1}^T - λ*W_temp)."""
@@ -270,7 +446,7 @@ class AttractorCortex(CorticalBlock):  # Extend CorticalBlock
 
 
 
-def cortex_step(cortex: AttractorCortex, x: torch.Tensor, da: float = 0.0) -> torch.Tensor:
+def cortex_step(cortex: AttractorCortex, x: torch.Tensor, raw_reward: float = 0.0) -> torch.Tensor:
     """
     One full timestep of the AI.
     Includes:
@@ -280,178 +456,241 @@ def cortex_step(cortex: AttractorCortex, x: torch.Tensor, da: float = 0.0) -> to
       - DA plasticity
       - replay hooks
     """
+    # Process reward through RewardModule to get dopamine signal (RPE)
+    dopamine_signal = cortex.process_reward(raw_reward)
+    # ALSO set last_reward for backward compatibility
+    cortex.last_reward = raw_reward
     # forward pass with attractor dynamics
     o = cortex.forward(x)
 
     # apply DA-modulated learning
-    cortex.learn(da_signal=da)
+    cortex.learn(da_signal=dopamine_signal)
 
     # optional replay
     if cortex.rhythm and cortex.rhythm.theta_in_window():
+        cortex.execute_background_replay()
         cortex.run_replay()
 
     return o
 
-if __name__ == "__main__":
-    print("Testing AttractorCortex Temporal Prediction...")
-    
-    # Setup
-    torch.manual_seed(42)
-    input_dim = 8
-    num_columns = 5
-    neurons_per_column = 4
-    
-    # Create columns
-    columns = []
-    for i in range(num_columns):
-        col = ProtoColumn(input_size=input_dim, num_neurons=neurons_per_column)
-        columns.append(col)
-    
-    # Create cortex
-    cortex = AttractorCortex(
-        columns=columns,
-        input_proj=True,
-        settling_steps=8,
-        k_sparsity=2
-    )
-    
-    print(f"Cortex: {cortex.C} columns, k={cortex.k_sparsity} sparsity")
-    
-    # Test 1: Basic prediction
-    print("\n1. Basic temporal prediction test:")
-    x1 = torch.randn(input_dim)
-    output1 = cortex.forward(x=x1)
-    
-    print(f"State: {output1}")
-    print(f"Prediction: {cortex.last_pred}")
-    print(f"Active units: {(output1 != 0).sum().item()}")
-    
-    # Test 2: Sequence learning
-    print("\n2. Sequence learning test:")
-    
-    # Learn A→B
-    pattern_a = torch.tensor([1.0, 0.0, 0.0, 0.0, 0.0])
-    pattern_b = torch.tensor([0.0, 1.0, 0.0, 0.0, 0.0])
-    
-    cortex.stable_state = pattern_a.clone()
-    cortex.last_state = pattern_a.clone()
-    cortex.last_pred = cortex.predict_next(pattern_a)
-    
-    print(f"Initial prediction of B from A: {cortex.last_pred}")
-    print(f"Initial error: {torch.norm(pattern_b - cortex.last_pred):.4f}")
-    
-    # Train transition
-    for i in range(10):
-        cortex.learn_temporal(pattern_b)
-    
-    cortex.last_pred = cortex.predict_next(pattern_a)
-    print(f"Trained prediction of B from A: {cortex.last_pred}")
-    print(f"Final error: {torch.norm(pattern_b - cortex.last_pred):.4f}")
-    
-    # Test 3: Different sparsity modes
-    print("\n3. Sparsity mode test:")
-    
-    test_vec = torch.tensor([0.8, 0.5, 0.3, 0.9, 0.1])
-    
-    # Hard k-WTA
-    hard_cortex = AttractorCortex(columns=columns, k_sparsity=2, use_soft_k=False)
-    hard_out = hard_cortex.apply_sparsity(test_vec)
-    print(f"Hard k-WTA (k=2): {hard_out}")
-    
-    # Soft k-WTA
-    soft_cortex = AttractorCortex(columns=columns, k_sparsity=2, use_soft_k=True)
-    soft_out = soft_cortex.apply_sparsity(test_vec)
-    print(f"Soft k-WTA: {soft_out}")
-    
-    # Test 4: Convergence
-    print("\n4. Convergence test:")
-    
-    for col in columns:
-        col.forward(torch.randn(input_dim))
-    
-    output = cortex.forward()
-    info = cortex.get_convergence_info()
-    print(f"Steps: {info['steps']}, Converged: {info['converged']}")
-    print(f"Final diff: {info['final_diff']:.6f}, Energy: {info['energy']:.6f}")
-    
-    print("\nAll tests passed!")
 
-    print("Testing Phase 2.9 - Rhythm-Integrated Attractor Cortex")
+# Fix the test section - REPLACE THE ENTIRE TEST CODE:
+
+if __name__ == "__main__":
+    print("Testing AttractorCortex with RewardModule & Episodic Memory...")
     print("=" * 70)
     
     torch.manual_seed(42)
     
     # Create rhythm engine
     rhythm = RhythmEngine(
-        theta_freq=4.0,
-        gamma_per_theta=8,
-        sim_steps_per_second=60,
-        theta_phase_window=(0.1, 0.2)
+        theta_freq=10.0,
+        gamma_per_theta=4,
+        sim_steps_per_second=100,
+        theta_phase_window=(0.0, 0.5)
     )
-    
-    print(f"Rhythm Engine: theta={rhythm.theta_freq}Hz, gamma={rhythm.gamma_per_theta}/theta")
     
     # Build columns
     input_size = 10
     num_columns = 4
     neurons_per_column = 5
     
-    cols = [ProtoColumn(input_size=input_size, num_neurons=neurons_per_column) for _ in range(num_columns)]
+    cols = [ProtoColumn(input_size=input_size, num_neurons=neurons_per_column) 
+            for _ in range(num_columns)]
     
-    # Create cortex with rhythm
+    # Create enhanced cortex with BOTH systems
     cortex = AttractorCortex(
         columns=cols,
         input_proj=True,
         rhythm=rhythm,
-        settling_steps=8
+        settling_steps=8,
+        k_sparsity=2,
+        
+        # Episodic memory parameters
+        buffer_capacity=100,
+        max_episode_length=5,  # SHORTER for testing
+        immediate_replay_threshold=0.5,  # ADJUSTED
+        background_replay_batch=2,
+        priority_decay=0.05,
+        
+        # Reward module parameters
+        value_lr=0.1,
+        baseline_reward=0.0
     )
     
-    print(f"\nCreated AttractorCortex with {cortex.C} columns")
-    print(f"Preferred gamma bins: {[col.preferred_gamma_bin for col in cortex.columns]}")
+    print(f"Created Enhanced AttractorCortex with:")
+    print(f"  • {cortex.C} columns")
+    print(f"  • RewardModule (V_lr={cortex.reward_module.value_lr})")
+    print(f"  • Episodic buffer: {cortex.buffer_capacity} capacity")
+    print(f"  • Max episode length: {cortex.max_episode_length}")
+    print(f"  • Immediate replay threshold: {cortex.immediate_replay_threshold}")
     
-    # Run integrated simulation
-    print(f"\nRunning rhythm-integrated simulation (200 steps)...")
-    print("-" * 50)
+    # Track big events
+    big_reward_steps = []
+    surprise_steps = []
     
-    for step in range(200):
+    # Run simulation
+    print(f"\nRunning integrated simulation (50 steps)...")
+    print("-" * 70)
+    print("Step | RawReward | Dopamine(RPE) | V | Buffer | Theta | I/B Replays")
+    print("-" * 70)
+    
+    prev_state = None
+    
+    for step in range(50):
+        # ====== CREATE MEANINGFUL INPUT AND REWARD ======
         x = torch.randn(input_size)
-        da = 1.0 if step % 30 == 0 else 0.0  # burst DA every 30 steps
+        raw_reward = 0.1  # Default baseline
         
-        # Use the unified cortex_step function
-        out = cortex_step(cortex, x, da=da)
+        # Schedule BIG rewards at specific steps
+        if step == 5:
+            raw_reward = 2.0  # Big positive
+            big_reward_steps.append(step)
+            x = torch.ones(input_size) * 0.5  # Distinct pattern
+        elif step == 15:
+            raw_reward = 1.5  # Medium positive
+            big_reward_steps.append(step)
+            x = torch.ones(input_size) * -0.5  # Distinct pattern
+        elif step == 25:
+            raw_reward = -1.0  # Negative
+            big_reward_steps.append(step)
+            x = torch.zeros(input_size)  # Distinct pattern
+        elif step == 35:
+            raw_reward = 3.0  # Very big positive
+            big_reward_steps.append(step)
+            x = torch.randn(input_size) * 2.0  # High variance
         
-        if step % 20 == 0:
-            theta_gate = rhythm.theta_in_window()
-            conv_info = cortex.get_convergence_info()
-            print(f"Step {step:3d} | DA: {da:.1f} | Theta Gate: {theta_gate} | "
-                  f"Conv: {conv_info['converged']} | Steps: {conv_info['steps']}")
+        # Add surprising patterns every 7 steps
+        if step % 7 == 0 and step > 0:
+            raw_reward += 0.5  # Bonus for surprise
+            surprise_steps.append(step)
+            x = torch.randn(input_size) * 3.0  # High variance = surprising
+        
+        # ====== EXECUTE CORTEX STEP ======
+        current_state = cortex_step(cortex, x, raw_reward)
+        
+        # Temporal learning
+        if prev_state is not None:
+            cortex.learn_temporal(current_state, da_signal=cortex.last_dopamine_signal)
+        
+        prev_state = current_state.clone()
+        
+        # ====== DEBUG OUTPUT ======
+        if step % 5 == 0 or step in big_reward_steps or step in surprise_steps:
+            stats = cortex.get_memory_statistics()
+            theta_active = cortex.rhythm.theta_in_window() if cortex.rhythm else False
+            
+            event_marker = ""
+            if step in big_reward_steps:
+                event_marker = "🎯"
+            elif step in surprise_steps:
+                event_marker = "⚡"
+            
+            print(f"{event_marker}{step:3d} | "
+                  f"Reward: {raw_reward:5.2f} | "
+                  f"Dopamine: {cortex.last_dopamine_signal:6.3f} | "
+                  f"V: {cortex.reward_module.V:5.3f} | "
+                  f"Buffer: {stats['buffer_size']:2d} | "
+                  f"Theta: {'✓' if theta_active else '✗'} | "
+                  f"Replays: {stats['immediate_replays']}I/{stats['background_replays']}B")
     
     print(f"\nSimulation completed!")
     
-    # Analyze rhythm effects
-    print(f"\nAnalysis of rhythm integration:")
-    print("-" * 50)
+    # ====== DETAILED ANALYSIS ======
+    print(f"\n" + "=" * 70)
+    print("DETAILED ANALYSIS")
+    print("=" * 70)
     
-    # Check column gamma bin distribution
-    bin_counts = {}
-    for col in cortex.columns:
-        bin_id = col.preferred_gamma_bin
-        bin_counts[bin_id] = bin_counts.get(bin_id, 0) + 1
+    # Reward Module Analysis
+    print(f"\n1. REWARD MODULE ANALYSIS:")
+    print("-" * 40)
+    print(f"Final V estimate: {cortex.reward_module.V:.3f}")
+    print(f"Big reward events at steps: {big_reward_steps}")
+    print(f"Surprise events at steps: {surprise_steps}")
     
-    print(f"Column distribution across gamma bins:")
-    for bin_id in sorted(bin_counts.keys()):
-        print(f"  Gamma bin {bin_id}: {bin_counts[bin_id]} columns")
+    # Episode Analysis
+    print(f"\n2. EPISODE ANALYSIS (all {len(cortex.episode_buffer.buffer)} episodes):")
+    print("-" * 40)
     
-    print(f"\nReplay memory size: {len(cortex.replay_memory)}")
-    print(f"Temporal weights mean: {torch.mean(cortex.W_temp):.4f}")
-    print(f"Rhythm steps: {rhythm.t}")
+    if len(cortex.episode_buffer.buffer) > 0:
+        immediate_triggered = 0
+        high_priority_episodes = []
+        
+        for i, episode in enumerate(cortex.episode_buffer.buffer):
+            above_threshold = episode.priority > cortex.immediate_replay_threshold
+            triggered = episode.replay_count > 0
+            
+            if above_threshold:
+                high_priority_episodes.append(episode)
+            
+            if triggered:
+                immediate_triggered += 1
+            
+            status = "🚨" if triggered else "  "
+            threshold_status = "ABOVE" if above_threshold else "below"
+            
+            print(f"{status} Ep {episode.id:2d}: "
+                  f"Priority={episode.priority:.3f} ({threshold_status} {cortex.immediate_replay_threshold}), "
+                  f"Steps={episode.length}, "
+                  f"AvgReward={episode.total_reward/episode.length:.3f}, "
+                  f"Replays={episode.replay_count}")
     
-    print("\n" + "=" * 70)
-    print("Phase 2.9 Integration COMPLETED!")
-    print("The system now has:")
-    print("✅ Rhythm-based temporal binding")
-    print("✅ Theta-gated plasticity")
-    print("✅ Gamma-phased column firing")
-    print("✅ Unified cortex_step() function")
-    print("✅ Memory replay system")
+    # Immediate Replay Debug
+    print(f"\n3. IMMEDIATE REPLAY DEBUG:")
+    print("-" * 40)
+    
+    if len(cortex.episode_buffer.buffer) > 0:
+        # Find episodes that SHOULD have triggered immediate replay
+        should_trigger = [ep for ep in cortex.episode_buffer.buffer 
+                         if ep.priority > cortex.immediate_replay_threshold]
+        
+        actually_triggered = [ep for ep in should_trigger if ep.replay_count > 0]
+        
+        print(f"Episodes above threshold ({cortex.immediate_replay_threshold}): {len(should_trigger)}")
+        print(f"Episodes that actually triggered immediate replay: {len(actually_triggered)}")
+        
+        if len(should_trigger) > 0 and len(actually_triggered) == 0:
+            print(f"\n❌ PROBLEM: Episodes above threshold but no immediate replay!")
+            print(f"Possible causes:")
+            print(f"1. _execute_immediate_replay() not being called")
+            print(f"2. needs_immediate flag not set in add_episode()")
+            print(f"3. Episode finishing after the step")
+            
+            # Debug the first high-priority episode
+            if should_trigger:
+                ep = should_trigger[0]
+                print(f"\nDebug episode {ep.id}:")
+                print(f"  Priority: {ep.priority:.3f}")
+                print(f"  Threshold: {cortex.immediate_replay_threshold}")
+                print(f"  Steps: {ep.length}")
+                print(f"  Total reward: {ep.total_reward:.3f}")
+                print(f"  Total surprise: {ep.total_surprise:.3f}")
+    
+    # System Check
+    print(f"\n4. SYSTEM CHECK:")
+    print("-" * 40)
+    
+    checks = [
+        ("Reward stored in episodes", any(ep.total_reward != 0 for ep in cortex.episode_buffer.buffer)),
+        ("Positive dopamine signals", any(step in big_reward_steps for step in range(50))),
+        ("Episodes being created", len(cortex.episode_buffer.buffer) > 0),
+        ("Background replays working", cortex.memory_stats['background_replays'] > 0),
+        ("Immediate replays working", cortex.memory_stats['immediate_replays'] > 0),
+    ]
+    
+    for check_name, passed in checks:
+        status = "✅" if passed else "❌"
+        print(f"{status} {check_name}")
+    
+    print(f"\n" + "=" * 70)
+    print("RECOMMENDATIONS:")
+    print("=" * 70)
+    
+    if cortex.memory_stats['immediate_replays'] == 0:
+        print("1. DEBUG _finish_current_episode() method - add print statements")
+        print("2. Check EpisodeBuffer.add_episode() return value")
+        print("3. Ensure immediate replay is called RIGHT AFTER episode finishes")
+        print("4. Lower immediate_replay_threshold to 0.3")
+    
+    print(f"\nPhase 2.10 + 2.4 Integration: {'COMPLETE' if cortex.memory_stats['immediate_replays'] > 0 else 'NEEDS DEBUGGING'}")
     print("=" * 70)
