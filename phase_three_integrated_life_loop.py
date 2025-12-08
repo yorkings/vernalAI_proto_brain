@@ -9,7 +9,7 @@ from phase_two_rhythm_engine import RhythmEngine
 from phase_three_predictive_block import PredictiveBlock
 from phase_three_predictive_heiracy import PredictiveHierarchy
 from phase_three_predictive_heiracy_controller import HierarchicalController
-
+import datetime
 # Set default dtype to float32 for consistency
 torch.set_default_dtype(torch.float32)
 
@@ -293,7 +293,7 @@ def ensure_block_float32(block):
 
 def hierarchical_step(system: Dict, x: torch.Tensor, 
                      agent_action: int, step_counter: int,
-                     raw_reward: Optional[float] = None) -> Dict:
+                     prev_reward: Optional[float] = None) -> Dict:
     """
     Integrated hierarchical step with FIXED reward timing
     
@@ -315,47 +315,31 @@ def hierarchical_step(system: Dict, x: torch.Tensor,
     # Process PREVIOUS reward if available (for learning)
     bottom_cortex = system['cortices'][0]
     dopamine_signal = 0.0
-    
-    if raw_reward is not None:
-        dopamine_signal = bottom_cortex.process_reward(raw_reward)
-        # Store for debugging
-        bottom_cortex.last_raw_reward = raw_reward
-        bottom_cortex.last_reward = raw_reward
-        
-        # === DEBUGGING ADDED HERE ===
-        print(f"[HIERARCHY DEBUG] Raw reward: {raw_reward:.3f}, Dopamine: {dopamine_signal:.3f}, "
-              f"V: {bottom_cortex.reward_module.V:.3f}")
-        
-        # Also check if raw_reward is actually non-zero:
-        if raw_reward == 0.0:
-            print(f"[WARNING] Raw reward is 0.0 at step {step_counter}")
-            # Note: We can't access env.position here since env is outside this function
-            # We'll need to pass it or handle differently
-    else:
-        # No reward this step (first step or no reward yet)
-        print(f"[HIERARCHY DEBUG] Step {step_counter}: No previous reward to process")
-        print(f"[HIERARCHY DEBUG] V value: {bottom_cortex.reward_module.V:.3f}")
-    
-    # Get plasticity gate from rhythm
+    if prev_reward is not None:
+        dopamine_signal = bottom_cortex.process_reward(prev_reward)
+        # DEBUG
+        print(f"[REWARD TIMING] Step {step_counter}: "
+              f"Processing reward from previous action: {prev_reward:.3f} → "
+              f"Dopamine (RPE): {dopamine_signal:.3f}, "
+              f"V estimate: {bottom_cortex.reward_module.V:.3f}")
+           
+    # SET PLASTICITY GATE
     plasticity_gate = 1.0
     if rhythm and rhythm.theta_in_window():
         plasticity_gate = 1.3  # Enhanced plasticity during theta
         rhythm.tick()
     
     # HIERARCHICAL PREDICTIVE PROCESSING (learn from previous reward)
-    top_representation = hierarchy.step(
-        sensory_input=x,
-        delta_da=dopamine_signal,
-        plasticity_gate=plasticity_gate,
-        inference_iterations=2
-    )
+    top_representation = hierarchy.step(sensory_input=x,delta_da=dopamine_signal,plasticity_gate=plasticity_gate,inference_iterations=2)
     
     # ACTION GENERATION
     action_prior = controller.propose(top_representation)
     
-    # Blend agent policy with hierarchical prior
-    prior_weight = min(0.5, 0.1 + (step_counter / 1000) * 0.4)
-    
+    #BLEND AGENT POLICY (with hierarchical prior)
+    base_weight = 0.1
+    max_weight = 0.5
+    training_progress = min(1.0, step_counter / 1000.0)
+    prior_weight = base_weight + (max_weight - base_weight) * training_progress
     agent_action_tensor = torch.tensor([float(agent_action)], dtype=torch.float32)
     blended_action = (1 - prior_weight) * agent_action_tensor + prior_weight * action_prior[0]
     
@@ -375,9 +359,9 @@ def hierarchical_step(system: Dict, x: torch.Tensor,
               f"Final: {final_action}")
     
     # Controller learning from PREVIOUS outcome (if we had a reward)
-    if raw_reward is not None:
-        success = raw_reward > 0
-        controller.learn_from_outcome(raw_reward, success)
+    if prev_reward is not None:
+        success = prev_reward > 0
+        controller.learn_from_outcome(prev_reward, success)
         # Debug controller learning
         if step_counter % 20 == 0:
             controller_info = controller.get_debug_info()
@@ -405,12 +389,13 @@ def hierarchical_step(system: Dict, x: torch.Tensor,
         'action_prior': action_prior,
         'final_action': final_action,
         'dopamine_signal': dopamine_signal,
-        'raw_reward_processed': raw_reward if raw_reward is not None else 0.0,
+        'prev_reward_processed': prev_reward if prev_reward is not None else 0.0,
         'hierarchy_state': hierarchy_state,
         'hierarchy_stats': hierarchy_stats,
         'prior_weight': prior_weight,
         'blended_action': blended_action.item(),
-        'V_value': bottom_cortex.reward_module.V if hasattr(bottom_cortex, 'reward_module') else 0.0
+        'V_value': bottom_cortex.reward_module.V if hasattr(bottom_cortex, 'reward_module') else 0.0,
+        'theta_active': rhythm.theta_in_window() if rhythm else False
     }
 
 def run_comprehensive_test(num_steps: int = 500):
@@ -420,13 +405,7 @@ def run_comprehensive_test(num_steps: int = 500):
     print("=" * 80)
     
     # Create system
-    system = create_hierarchical_system(
-        input_size=10,
-        base_columns=4,  
-        hierarchy_factor=0.75,    
-        neurons_per_column=5
-    )
-    
+    system = create_hierarchical_system(input_size=10,base_columns=4,hierarchy_factor=0.75, neurons_per_column=5)
     # Create environment
     env = TestEnvironment(input_size=10)
     
@@ -458,8 +437,7 @@ def run_comprehensive_test(num_steps: int = 500):
             return 0
     
     # Main loop
-    prev_raw_reward = 0.0
-    prev_position = env.position 
+    reward_from_previous_action = None  # Initially no previous action
     for step in range(num_steps):
         # Get state
         x = env.get_state_vector()
@@ -468,29 +446,15 @@ def run_comprehensive_test(num_steps: int = 500):
         agent_action = agent_policy(env.position, env.goal)
         
         # Hierarchical step with PREVIOUS reward (from step-1)
-        result = hierarchical_step(system, x, agent_action, step, prev_raw_reward)
-        # Store previous position BEFORE taking action
-        prev_position = env.position
-        # Take action and get CURRENT reward
-        current_raw_reward = env.step(result['final_action'])
-
-        # === DEBUG ENVIRONMENT STATE ===
-        if step % 10 == 0:
-            distance = abs(env.position - env.goal)
-            print(f"[ENV DEBUG] Step {step}: "
-                f"Pos: {prev_position:.2f}→{env.position:.2f}, "
-                f"Goal: {env.goal}, "
-                f"Distance: {distance:.2f}, "
-                f"Reward: {current_raw_reward:.3f}, "
-                f"Action: {result['final_action']}")
-            
-        # Store for next iteration
-        prev_raw_reward = current_raw_reward
+        result = hierarchical_step(system, x, agent_action, step, prev_reward=reward_from_previous_action)
+        # Take action in environment and get CURRENT reward
+        current_reward = env.step(result['final_action'])
          # Update reward in system for episode recording
-        system['cortices'][0].last_reward = current_raw_reward
-        
+        system['cortices'][0].last_reward = current_reward
+         # ===== STORE FOR NEXT ITERATION =====
+        reward_from_previous_action = current_reward  # This becomes previous reward for next step
         # Collect statistics
-        stats['rewards'].append(current_raw_reward)  # Current reward
+        stats['rewards'].append(current_reward)  # Current reward
         stats['dopamine_signals'].append(result['dopamine_signal'])  # DA from previous
         stats['actions'].append(result['final_action'])
         stats['convergence'].append(result['hierarchy_state']['convergence'])
@@ -505,7 +469,7 @@ def run_comprehensive_test(num_steps: int = 500):
             hierarchy_state = result['hierarchy_state']
             print(f"Step {step:4d} | "
                   f"Pos: {env.position:6.2f} | "
-                  f"Reward: {current_raw_reward:6.2f} | "
+                  f"Reward: {current_reward:6.2f} | "
                   f"DA: {result['dopamine_signal']:6.3f} | "
                   f"Action: {result['final_action']:2d} | "
                   f"Hierarchy errors: {[f'{e:.3f}' for e in hierarchy_state['errors']]}")
@@ -660,12 +624,14 @@ def plot_results(stats, num_levels):
     axes[2, 1].grid(True, alpha=0.3)
     
     plt.tight_layout()
-    plt.savefig('phase_three_results.png', dpi=150)
+    timestamp=datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    file= f'graphs/phase_three_results_{timestamp}.png'
+    plt.savefig(file, dpi=150)
     plt.show()
 
 if __name__ == "__main__":
     # Run comprehensive test
-    stats, system = run_comprehensive_test(num_steps=500)
+    stats, system = run_comprehensive_test(num_steps=1000)
     
     # Additional debugging information
     print(f"\n" + "=" * 80)

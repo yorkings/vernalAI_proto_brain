@@ -3,8 +3,7 @@ from typing import Optional
 from phase_two_attractor_cotex import AttractorCortex 
 
 class PredictiveBlock:
-    def __init__(self, base_cortex: AttractorCortex, dim_rep: int,
-                 gen_init_scale: float = 0.05, rec_init_scale: float = 0.05,
+    def __init__(self, base_cortex: AttractorCortex, dim_rep: int,gen_init_scale: float = 0.05, rec_init_scale: float = 0.05,
                  kappa: float = 0.2,           # Inference step size
                  alpha_G: float = 1e-3,        # Generative learning rate
                  alpha_R: float = 1e-3,        # Recognition learning rate
@@ -65,6 +64,7 @@ class PredictiveBlock:
         # Ensure Pi dimension matches dim_rep
         if self.Pi.shape[0] != self.dim:
             self.Pi = torch.ones(self.dim, dtype=torch.float32) * precision_init
+            
         
     def normalize_weights(self):
         """Normalize weights for stability"""

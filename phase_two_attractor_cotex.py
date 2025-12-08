@@ -238,7 +238,7 @@ class AttractorCortex(CorticalBlock):  # Extend CorticalBlock
         # Finalize episode
         self.current_episode.finalize(current_time=self.global_timestep) 
         # Add to buffer
-        needs_immediate = self.episode_buffer.add_episode(self.current_episode)
+        needs_immediate = self.episode_buffer.add_episode(self.current_episode,threshold=self.immediate_replay_threshold)
         # Immediate replay if needed
         if needs_immediate:
             self._execute_immediate_replay(self.current_episode)      

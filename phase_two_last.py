@@ -93,7 +93,7 @@ class EpisodeBuffer:
         self.buffer: List[Episode] = []
         self.next_id = 0
         
-    def add_episode(self, episode: Episode) -> bool:
+    def add_episode(self, episode: Episode,threshold: float = 1.5) -> bool:
         """Add episode, return True if needs immediate replay"""
         episode.id = self.next_id
         self.next_id += 1
@@ -101,9 +101,15 @@ class EpisodeBuffer:
         # Evict if over capacity
         if len(self.buffer) > self.capacity:
             self._evict_lowest_priority()  
+        #Use provided threshold (from cortex) or default    
         # Immediate replay if priority > threshold
-        return episode.priority > 1.5
-        
+        needs_immediate=episode.priority > threshold
+         # DEBUG LOGGING
+        if needs_immediate:
+            print(f"[MEMORY] Episode {episode.id} triggered immediate replay: "
+                f"priority={episode.priority:.3f} > threshold={threshold:.3f}") 
+        return needs_immediate
+            
     def _evict_lowest_priority(self):
         """Remove episode with lowest priority"""
         if not self.buffer:
