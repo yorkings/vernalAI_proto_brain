@@ -1,6 +1,8 @@
 import torch
 from phase_one_layers_neurons import ProtoLayer
 import random
+torch.set_default_dtype(torch.float32)
+
 class ProtoColumn:
     def __init__( self,input_size: int,num_neurons: int = 5,lr: float = 0.01,inhibition_strength: float = 0.2, cooperation_strength: float = 0.1,
                  trace_decay: float = 0.9,elig_decay: float = 0.9,gamma_per_theta:int=8):

@@ -1,4 +1,5 @@
 import torch
+torch.set_default_dtype(torch.float32)
 class ProtoNeuronMod:
     def __init__(self, input_size: int, learning_rate: float = 0.01,decay: float = 0.9, init_scale: float = 0.1,elig_decay: float = 0.9, local_lr: float = 0.01):
         self.input_size = input_size
@@ -6,8 +7,8 @@ class ProtoNeuronMod:
         self.local_lr = local_lr            # for local Hebbian updates
         self.gamma = decay
         # Weights & bias
-        self.weights = ((torch.randn(input_size) * 2.0) - 1.0) * init_scale
-        self.bias = ((torch.randn(1) * 2.0) - 1.0) * init_scale 
+        self.weights = ((torch.randn(input_size,dtype=torch.float32) * 2.0) - 1.0) * init_scale
+        self.bias = ((torch.randn(1,dtype=torch.float32) * 2.0) - 1.0) * init_scale 
         # State
         self.trace = torch.tensor(0.0)
         self.last_input = torch.zeros(input_size)

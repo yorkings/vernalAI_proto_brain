@@ -7,6 +7,7 @@ from phase_two_last import EpisodeBuffer,EpisodeStep,Episode
 from phase_two_reward import RewardModule
 
 import math
+torch.set_default_dtype(torch.float32)
 
 class AttractorCortex(CorticalBlock):  # Extend CorticalBlock
     def __init__(self, columns: List[ProtoColumn],input_proj: bool = False,rho: float = 0.3,eta: float = 0.01, weight_decay: float = 1e-4,init_scale: float = 0.02, 
@@ -16,7 +17,7 @@ class AttractorCortex(CorticalBlock):  # Extend CorticalBlock
                  rhythm:Optional[RhythmEngine]=None,
                  #episodic memmory
                  buffer_capacity: int = 200, max_episode_length: int = 10,immediate_replay_threshold: float = 0.2, background_replay_batch: int = 2,priority_decay: float = 0.05,
-                  value_lr: float = 0.01, baseline_reward: float = 0.0
+                  value_lr: float = 0.01, baseline_reward: float = 0.1
                   ):
         # Initialize parent CorticalBlock
         super().__init__(columns, input_proj, rho, eta, weight_decay,init_scale, reduce_fn)
@@ -27,7 +28,8 @@ class AttractorCortex(CorticalBlock):  # Extend CorticalBlock
         self.convergence_thresh = convergence_thresh
 
 
-        self.col_activation_avg = torch.zeros(self.C)
+        self.col_activation_avg = torch.zeros(self.C,dtype=torch.float32)
+        self.eligibility = torch.zeros_like(self.W, dtype=torch.float32)
 
         #homeostasis params
         self.homeo_lr=homeo_lr
@@ -46,7 +48,7 @@ class AttractorCortex(CorticalBlock):  # Extend CorticalBlock
         self.converged = False    # Whether last forward converged
         self.settling_history = []  # Track convergence per step
         
-        self.W_temp = torch.randn(self.C, self.C) * 0.05
+        self.W_temp = torch.randn(self.C, self.C,dtype=torch.float32) * 0.05
         self.eta_temp = 0.01
         self.temp_weight_decay = 1e-4
 

@@ -14,10 +14,12 @@ class RewardModule:
         Returns dopamine signal (RPE).
         t​=rt​−r^t​
         """
-        r = float(reward)
-        delta = r - self.V  # RPE
+        print(f"[REWARD DEBUG] r={reward}, V={self.V}")
+        delta = reward - self.V
         self.V += self.value_lr * delta  # update value estimate
+        print(f"[REWARD DEBUG] δ={delta}, new V={self.V}")
         return float(delta)
+    
     def reset(self):
         """Reset value estimate to baseline."""
         self.V = 0.0 
