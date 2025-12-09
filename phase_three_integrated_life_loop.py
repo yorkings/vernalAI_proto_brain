@@ -109,7 +109,10 @@ def convert_column_neurons_to_float32(col):
 def create_hierarchical_system(input_size: int = 10,
                                base_columns: int = 4,  
                                hierarchy_factor: float = 0.75,
-                               neurons_per_column: int = 5) -> Dict:
+                               neurons_per_column: int = 5,
+                               enable_planning: bool = True,
+                                goal_dim: int = 32,
+                                lookahead_steps: int = 3) -> Dict:
     """
     Create hierarchical system with decreasing dimensions
     """
@@ -216,14 +219,53 @@ def create_hierarchical_system(input_size: int = 10,
     controller.M = controller.M.to(torch.float32)
     controller.b = controller.b.to(torch.float32)
     
-    return {
-        'hierarchy': hierarchy,
-        'controller': controller,
-        'rhythm': rhythm,
-        'cortices': cortices,
-        'predictive_blocks': predictive_blocks,
-        'levels': len(num_columns_per_level)
-    }
+    if enable_planning:
+        # Import the new planning classes (they should be in a new file)
+        from phase_four_planning import ForwardSimulator, GoalSystem, BiologicalPlanner
+        
+        # Create forward simulator using the bottom cortex
+        forward_sim = ForwardSimulator(
+            cortical_block=cortices[0],  # Bottom cortex for simulation
+            lookahead_steps=lookahead_steps
+        )
+        
+        # Create goal system
+        goal_system = GoalSystem(
+            input_size=input_size,
+            goal_dim=goal_dim
+        )
+        
+        # Create planner
+        planner = BiologicalPlanner(
+            forward_sim=forward_sim,
+            goal_system=goal_system
+        )
+        
+        # Add to return dictionary
+        return {
+            'hierarchy': hierarchy,
+            'controller': controller,
+            'rhythm': rhythm,
+            'cortices': cortices,
+            'predictive_blocks': predictive_blocks,
+            'levels': len(num_columns_per_level),
+            # ADD THESE:
+            'forward_sim': forward_sim,
+            'goal_system': goal_system,
+            'planner': planner,
+            'enable_planning': enable_planning
+        }
+    else:
+        # Return original system without planning
+        return {
+            'hierarchy': hierarchy,
+            'controller': controller,
+            'rhythm': rhythm,
+            'cortices': cortices,
+            'predictive_blocks': predictive_blocks,
+            'levels': len(num_columns_per_level),
+            'enable_planning': False
+        }
 
 def ensure_cortex_float32(cortex):
     """Ensure all cortex tensors are float32"""
@@ -293,7 +335,8 @@ def ensure_block_float32(block):
 
 def hierarchical_step(system: Dict, x: torch.Tensor, 
                      agent_action: int, step_counter: int,
-                     prev_reward: Optional[float] = None) -> Dict:
+                     prev_reward: Optional[float] = None,
+                     ) -> Dict:
     """
     Integrated hierarchical step with FIXED reward timing
     

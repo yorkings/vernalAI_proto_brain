@@ -129,7 +129,7 @@ class AttractorCortex(CorticalBlock):  # Extend CorticalBlock
         regularization = self.energy_weight * torch.sum(o**2)
         return (recurrent_energy + regularization).item()
     
-    def forward(self, x: torch.Tensor = None,replay_mode: bool = False) -> torch.Tensor:
+    def forward(self, x: torch.Tensor = None,replay_mode: bool = False,imaginary_mode: bool = False) -> torch.Tensor:
         """Forward pass with attractor settling, temporal prediction, AND episode recording"""
          # Set replay mode
         self.replay_mode = replay_mode
