@@ -177,7 +177,12 @@ def create_hierarchical_system(input_size: int = 10,
         cortex = ensure_cortex_float32(cortex)
         
         cortices.append(cortex)
-    
+    rep_dims = [base_columns]
+    for i in range(1, len(cortices)):
+        next_dim = max(2, int(rep_dims[-1] * hierarchy_factor))
+        rep_dims.append(next_dim)
+
+    print(f"[DEBUG] Representation dimensions: {rep_dims}")
     # CREATE PREDICTIVE BLOCKS
     predictive_blocks = []
     
@@ -187,7 +192,7 @@ def create_hierarchical_system(input_size: int = 10,
         
         block = PredictiveBlock(
             base_cortex=cortex,
-            dim_rep=cortex.C,
+            dim_rep=rep_dims[level_idx],
             gen_init_scale=0.03 / (level_idx + 1),
             rec_init_scale=0.03 / (level_idx + 1),
             kappa=0.15 / (level_idx + 1),  # Slower inference for higher levels
@@ -207,7 +212,8 @@ def create_hierarchical_system(input_size: int = 10,
     hierarchy = PredictiveHierarchy(predictive_blocks)
     
     # CREATE CONTROLLER
-    top_dim = predictive_blocks[-1].dim
+    top_dim = rep_dims[-1]
+    print(f"[DEBUG] Controller using top_dim = {top_dim}")
     controller = HierarchicalController(
         rep_dim=top_dim,
         action_dim=3,  # For 1D world: {-1, 0, +1}
@@ -228,10 +234,10 @@ def create_hierarchical_system(input_size: int = 10,
             cortical_block=cortices[0],  # Bottom cortex for simulation
             lookahead_steps=lookahead_steps
         )
-        
+        input_size_for_goal = cortices[0].columns[0].layer.input_size
         # Create goal system
         goal_system = GoalSystem(
-            input_size=input_size,
+            input_size=input_size_for_goal,
             goal_dim=goal_dim
         )
         
@@ -674,7 +680,7 @@ def plot_results(stats, num_levels):
 
 if __name__ == "__main__":
     # Run comprehensive test
-    stats, system = run_comprehensive_test(num_steps=1000)
+    stats, system = run_comprehensive_test(num_steps=200)
     
     # Additional debugging information
     print(f"\n" + "=" * 80)

@@ -5,6 +5,7 @@ from phase_two_rhythm_engine import RhythmEngine
 from typing import List,Callable,Optional,Dict
 from phase_two_last import EpisodeBuffer,EpisodeStep,Episode
 from phase_two_reward import RewardModule
+from typing import Any
 
 import math
 torch.set_default_dtype(torch.float32)
@@ -17,7 +18,14 @@ class AttractorCortex(CorticalBlock):  # Extend CorticalBlock
                  rhythm:Optional[RhythmEngine]=None,
                  #episodic memmory
                  buffer_capacity: int = 200, max_episode_length: int = 10,immediate_replay_threshold: float = 0.2, background_replay_batch: int = 2,priority_decay: float = 0.05,
-                  value_lr: float = 0.01, baseline_reward: float = 0.1
+                  value_lr: float = 0.01, baseline_reward: float = 0.1,
+                   # PHASE 5 ADDITIONS
+                 enable_phase5: bool = True,da_gamma: float = 0.9,da_tau_tonic: float = 0.995,da_k: float = 2.0,da_max: float = 1.0,
+                  # PHASE 5.9: Intrinsic Motivation Parameters
+                 enable_intrinsic_motivation: bool = True,c_nov: float = 0.2, c_lp: float = 1.0, novelty_decay: float = 0.999, window_size: int = 50,
+                 # PHASE 5.11: Prioritized Replay Parameters
+                 enable_prioritized_replay: bool = True,replay_capacity: int = 500,surprise_store_thresh: float = 0.12,replay_alpha: float = 0.6,replay_beta: float = 0.4,
+                 replay_scale: float = 0.5,replay_interval: int = 10,surprise_trigger_thresh: float = 0.25,theta_window_replay_only: bool = True,
                   ):
         # Initialize parent CorticalBlock
         super().__init__(columns, input_proj, rho, eta, weight_decay,init_scale, reduce_fn)
@@ -61,11 +69,11 @@ class AttractorCortex(CorticalBlock):  # Extend CorticalBlock
         if rhythm is not None:
             for col in self.columns:
                 col.preferred_gamma_bin= torch.randint(low=0,high=rhythm.gamma_per_theta, size=(1,)).item()
-        # ========== REWARD MODULE (Phase 2.4) ==========
+        #  REWARD MODULE (Phase 2.4) 
         self.reward_module = RewardModule(value_lr=value_lr, baseline=baseline_reward)
         self.last_raw_reward = 0.0  # Store the raw reward before RPE calculation
         self.last_dopamine_signal = 0.0  # Store the dopamine (RPE) signal        
-         # ========== EPISODIC MEMORY ADDITIONS (Phase 2.10) ==========
+         #  EPISODIC MEMORY ADDITIONS (Phase 2.10) 
         self.buffer_capacity = buffer_capacity
         self.max_episode_length = max_episode_length
         self.immediate_replay_threshold = immediate_replay_threshold
@@ -99,8 +107,160 @@ class AttractorCortex(CorticalBlock):  # Extend CorticalBlock
         self.replay_memory = []
         self.max_replay_length = 50   
         # For tracking reward/surprise
-        self.last_reward = 0.0
-        self.last_prediction_error = 0.0  
+        self.last_prediction_error = 0.0 
+        self.last_surprise = 0.0
+        self.last_prediction_error = 0.0
+        self.last_reward = 0.0 
+
+        self.enable_phase5 = enable_phase5
+        if enable_phase5:
+            from phase_five_neuromodulator import TorchNeuromodulator
+            
+            self.neuromodulator = TorchNeuromodulator(
+                gamma=da_gamma,
+                tau_tonic=da_tau_tonic,
+                k=da_k,
+                DA_max=da_max
+            )
+            
+            # Phase 5 state tracking
+            self.last_DA_phasic = torch.tensor(0.0, dtype=torch.float32)
+            self.last_DA_tonic = torch.tensor(0.0, dtype=torch.float32)
+            self.last_surprise_for_DA = 0.0
+            self.last_error_for_DA = 0.0
+            
+            # Intrinsic reward parameters
+            self.intrinsic_reward_enabled = True
+            self.c1_intrinsic = 1.0  # Learning progress weight
+            self.c2_novelty = 0.2    # Novelty weight
+            
+            print(f"[Phase 5] Dopamine neuromodulator initialized: "
+                  f"gamma={da_gamma}, tau_tonic={da_tau_tonic}, DA_max={da_max}")
+        
+        self.last_stable_state = None  # For novelty computation
+        
+        # Also add:
+        self.last_error_for_DA_prev =0.0 # For learning progress calculation 
+
+        self.enable_intrinsic_motivation = enable_intrinsic_motivation
+        if enable_intrinsic_motivation:
+            from phase_five_intrinsic_motivation import IntrinsicMotivationEngine
+            self.intrinsic_engine = IntrinsicMotivationEngine(
+                c_nov=c_nov,
+                c_lp=c_lp,
+                novelty_decay=novelty_decay,
+                window_size=window_size
+            )
+            
+            print(f"[Phase 5.9] Intrinsic Motivation Engine initialized: "
+                  f"c_nov={c_nov}, c_lp={c_lp}, window_size={window_size}")
+            
+        #  PHASE 5.11: PRIORITIZED REPLAY 
+        self.enable_prioritized_replay = enable_prioritized_replay
+        if enable_prioritized_replay:
+            from phase_five_prioritized_replay import PrioritizedReplayBuffer, ReplayScheduler
+            
+            self.replay_buffer = PrioritizedReplayBuffer(
+                capacity=replay_capacity,
+                surprise_store_thresh=surprise_store_thresh,
+                alpha=replay_alpha,
+                beta=replay_beta,
+                replay_scale=replay_scale
+            )
+            
+            self.replay_scheduler = ReplayScheduler(
+                replay_interval=replay_interval,
+                surprise_trigger_thresh=surprise_trigger_thresh,
+                theta_window_only=theta_window_replay_only,
+                max_replays_per_theta=2
+            )
+            
+            print(f"[Phase 5.11] Prioritized Replay initialized: "
+                  f"capacity={replay_capacity}, surprise_thresh={surprise_store_thresh}, "
+                  f"theta_only={theta_window_replay_only}")    
+           
+            
+    def update_dopamine(self, 
+                   external_reward: float = 0.0,
+                   surprise: Optional[float] = None,
+                   use_intrinsic: bool = True) -> dict:
+        """
+        Updated dopamine computation with intrinsic motivation
+        """
+        if not self.enable_phase5:
+            return {
+                'DA_phasic': torch.tensor(0.0),
+                'DA_tonic': torch.tensor(0.0),
+                'R_total': external_reward,
+                'R_intrinsic': 0.0
+            }
+        
+        # Compute intrinsic reward if enabled
+        R_intrinsic = 0.0
+        intrinsic_components = {}
+        
+        if use_intrinsic and surprise is not None and self.enable_intrinsic_motivation:
+            # Use the intrinsic motivation engine
+            if self.stable_state is not None:
+                R_intrinsic = self.intrinsic_engine.update(
+                    state=self.stable_state,
+                    prediction_error=surprise
+                )
+                
+                # Get component breakdown for debugging
+                intrinsic_components = self.intrinsic_engine.get_intrinsic_reward_components(
+                    self.stable_state
+                )
+        elif use_intrinsic and surprise is not None:
+            # Fallback to simple intrinsic reward (old method)
+            if hasattr(self, 'last_error_for_DA') and self.last_error_for_DA is not None:
+                learning_progress = self.last_error_for_DA - surprise
+                learning_progress = max(-1.0, min(1.0, learning_progress))
+                R_intrinsic = self.c1_intrinsic * learning_progress
+        
+        # Total reward
+        R_total = external_reward + R_intrinsic
+        R_total = max(-1.0, min(1.0, R_total))
+        R_total_tensor = torch.tensor(R_total, dtype=torch.float32)
+        
+        # Store error for next update (for learning progress calculation)
+        if surprise is not None:
+            self.last_error_for_DA = surprise
+        
+        # Compute dopamine drive
+        drive = self.neuromodulator.compute_drive(
+            reward=R_total_tensor,
+            surprise=torch.tensor(surprise, dtype=torch.float32) if surprise is not None else None,
+            error_change=torch.tensor(self.last_error_for_DA_prev - surprise, dtype=torch.float32) 
+                    if hasattr(self, 'last_error_for_DA_prev') and surprise is not None else None,
+            alpha=1.0,
+            beta=0.5
+        )
+        
+        # Update dopamine signals
+        DA_phasic = self.neuromodulator.update_phasic(drive)
+        DA_tonic = self.neuromodulator.update_tonic()
+        
+        # Store for next update
+        self.last_DA_phasic = DA_phasic.clone()
+        self.last_DA_tonic = DA_tonic.clone()
+        
+        # Store previous error for next cycle
+        if surprise is not None:
+            self.last_error_for_DA_prev = self.last_error_for_DA
+        
+        # Exploration scale
+        explore_scale = self.neuromodulator.exploration_scale()
+        
+        return {
+            'DA_phasic': DA_phasic,
+            'DA_tonic': DA_tonic,
+            'R_total': R_total,
+            'R_intrinsic': R_intrinsic,
+            'R_intrinsic_components': intrinsic_components if intrinsic_components else {},
+            'explore_scale': explore_scale,
+            'drive': drive.item() if hasattr(drive, 'item') else drive
+        }
 
     def process_reward(self, raw_reward: float) -> float:
         """
@@ -200,6 +360,26 @@ class AttractorCortex(CorticalBlock):  # Extend CorticalBlock
 
         if not self.replay_mode and x is not None:
             self._record_step(x, o)
+        # Store for replay if not in replay mode and surprise is significant
+        if (not replay_mode and not imaginary_mode and 
+            self.enable_prioritized_replay and 
+            hasattr(self, 'last_surprise') and 
+            self.last_surprise is not None):
+            
+            # Only store if we have prediction and state
+            if self.last_pred is not None and self.last_state is not None:
+                stored = self.store_for_replay(
+                    state_vec=self.last_state,
+                    action=None,  # Action would come from planner
+                    predicted=self.last_pred,
+                    actual=o[:len(self.last_pred)] if len(o) > len(self.last_pred) else o,
+                    surprise=self.last_surprise,
+                    metadata={
+                        'step': self.global_timestep,
+                        'converged': self.converged,
+                        'energy': self.energy_value
+                    }
+                )    
 
         return o
     
@@ -331,7 +511,7 @@ class AttractorCortex(CorticalBlock):  # Extend CorticalBlock
         mask = (o >= T).float()
         return o * mask        
 
-    def learn(self,da_signal: float = 1.0) -> None:
+    def learn(self,da_signal: float = 1.0, use_phase5_gating: bool = True) -> None:
         """
         Enhanced learn method that tracks surprise for episode recording
         Learn using Oja's rule with energy regularization.   
@@ -341,6 +521,28 @@ class AttractorCortex(CorticalBlock):  # Extend CorticalBlock
         if self.last_error is not None:
             self.last_surprise = torch.norm(self.last_error, p=1).item()
             self.last_prediction_error = self.last_surprise
+                # Use Phase 5 dopamine if available
+        # Use Phase 5 dopamine if available - FIX VERSION
+        if self.enable_phase5 and use_phase5_gating:
+            # Get current dopamine signal
+            current_DA = self.last_DA_phasic.item() if hasattr(self, 'last_DA_phasic') else da_signal
+            current_DA_tonic = self.last_DA_tonic.item() if hasattr(self, 'last_DA_tonic') else 0.0
+            # FIX: Theta-gated learning enhancement
+            if self.rhythm and self.rhythm.theta_in_window():
+                # Boost learning during theta windows (biological: LTP facilitated)
+                theta_boost = 1.5  # 50% boost during theta
+                learn_gate = 1.0 if abs(current_DA) > 0.05 else 0.0
+                effective_da = current_DA * learn_gate * theta_boost
+                #print(f"[THETA] Learning boosted during theta window: {theta_boost}x")
+            else:
+                # Reduce learning outside theta windows
+                theta_reduce = 0.3  # 70% reduction
+                learn_gate = 1.0 if abs(current_DA) > 0.05 else 0.0
+                effective_da = current_DA * learn_gate * theta_reduce
+        else:
+            effective_da = da_signal
+            current_DA = da_signal
+            current_DA_tonic = 0.0
 
         if self.rhythm and not self.rhythm.theta_in_window():
             return 
@@ -366,6 +568,11 @@ class AttractorCortex(CorticalBlock):  # Extend CorticalBlock
         self.homeostasis_update(o)
         self.synaptic_scaling()
         self.normalize_recurrent_weights()
+        # Pass dopamine to columns for neuron-level learning
+        for col in self.columns:
+            col.learn(delta=effective_da, gate=1.0, mix_local=0.5,
+                      DA_phasic=current_DA, DA_tonic=current_DA_tonic, DA_baseline=0.0,
+            prediction_error=self.last_surprise if hasattr(self, 'last_surprise') else None)
 
   
     def get_memory_statistics(self) -> Dict:
@@ -411,6 +618,112 @@ class AttractorCortex(CorticalBlock):  # Extend CorticalBlock
         
         if len(self.replay_memory) > self.max_replay_length:
             self.replay_memory.pop(0)
+    def store_for_replay(self,  state_vec: torch.Tensor,
+                     action: Any,
+                     predicted: torch.Tensor,
+                     actual: torch.Tensor,
+                     surprise: float,
+                     metadata: Optional[Dict] = None) -> bool:
+        """
+        Store transition in replay buffer if surprise is high enough
+        """
+        if not self.enable_prioritized_replay or not hasattr(self, 'replay_buffer'):
+            return False
+        
+        # Create state fingerprint (simple hash of quantized state)
+        state_fp = self._create_state_fingerprint(state_vec)
+        
+        # Store in buffer
+        stored = self.replay_buffer.add(
+            state_fp=state_fp,
+            state_vec=state_vec,
+            action=action,
+            predicted=predicted,
+            actual=actual,
+            surprise=surprise,
+            metadata=metadata
+        )
+        
+        return stored
+
+    def _create_state_fingerprint(self, state: torch.Tensor) -> str:
+        """Create simple fingerprint for state"""
+        if state is None:
+            return "none"
+        
+        # Quantize state to create fingerprint
+        quantized = (state.detach() * 10).round().int()  # Scale and round
+        fp_parts = []
+        
+        # Take first few dimensions for fingerprint
+        for i in range(min(5, len(quantized))):
+            val = quantized[i].item()
+            fp_parts.append(f"{val:+03d}")
+        
+        return "_".join(fp_parts)
+
+    def execute_prioritized_replay(self, 
+                                forward_sim=None,
+                                k: int = 3,
+                                force: bool = False) -> Dict:
+        """
+        Execute prioritized replay if conditions are met
+        
+        Args:
+            forward_sim: Forward simulator for imagination (uses self if None)
+            k: Number of items to replay
+            force: Force replay regardless of scheduler
+            
+        Returns:
+            Replay results dictionary
+        """
+        if not self.enable_prioritized_replay or not hasattr(self, 'replay_buffer'):
+            return {'replayed': 0, 'reason': 'disabled'}
+        
+        # Check if we should replay
+        should_replay = force
+        if not force and hasattr(self, 'replay_scheduler'):
+            theta_active = self.rhythm.theta_in_window() if self.rhythm else False
+            should_replay = self.replay_scheduler.should_replay(
+                current_step=self.global_timestep,
+                surprise=self.last_surprise if hasattr(self, 'last_surprise') else None,
+                theta_active=theta_active
+            )
+        
+        if not should_replay:
+            return {'replayed': 0, 'reason': 'scheduler_denied'}
+        
+        # Use self as forward simulator if none provided
+        if forward_sim is None:
+            forward_sim = self
+        
+        # Execute replay
+        replay_result = self.replay_buffer.replay_step(
+            forward_sim=forward_sim,
+            cortex=self,
+            k=k,
+            replay_strategy='mixed'
+        )
+        
+        # Update memory statistics
+        if replay_result['replayed'] > 0:
+            self.memory_stats['total_replay_steps'] += replay_result['replayed']
+            self.memory_stats['background_replays'] += 1
+        
+        return replay_result
+
+    def get_replay_statistics(self) -> Dict:
+        """Get prioritized replay statistics"""
+        if not self.enable_prioritized_replay:
+            return {'enabled': False}
+        
+        stats = {
+            'enabled': True,
+            'buffer_stats': self.replay_buffer.get_statistics() if hasattr(self, 'replay_buffer') else {},
+            'scheduler_stats': self.replay_scheduler.get_statistics() if hasattr(self, 'replay_scheduler') else {}
+        }
+        
+        return stats         
     
     def run_replay(self):
         if not self.replay_memory or not self.rhythm:
@@ -444,10 +757,6 @@ class AttractorCortex(CorticalBlock):  # Extend CorticalBlock
         }
 
 
-
-
-
-
 def cortex_step(cortex: AttractorCortex, x: torch.Tensor, raw_reward: float = 0.0) -> torch.Tensor:
     """
     One full timestep of the AI.
@@ -458,10 +767,12 @@ def cortex_step(cortex: AttractorCortex, x: torch.Tensor, raw_reward: float = 0.
       - DA plasticity
       - replay hooks
     """
-    # Process reward through RewardModule to get dopamine signal (RPE)
-    dopamine_signal = cortex.process_reward(raw_reward)
     # ALSO set last_reward for backward compatibility
     cortex.last_reward = raw_reward
+
+    # Process reward through RewardModule to get dopamine signal (RPE)
+    dopamine_signal = cortex.process_reward(raw_reward)
+    
     # forward pass with attractor dynamics
     o = cortex.forward(x)
 

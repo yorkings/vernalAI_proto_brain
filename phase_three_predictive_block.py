@@ -136,6 +136,15 @@ class PredictiveBlock:
         
         # Clamp error to prevent explosion
         err = torch.clamp(err, -2.0, 2.0)
+        # FIX: Ensure prediction matches input dimension
+        if self.o_pred.shape[0] != lower_o.shape[0]:
+            # Resize prediction to match input
+            if self.o_pred.shape[0] < lower_o.shape[0]:
+                pad_size = lower_o.shape[0] - self.o_pred.shape[0]
+                padding = torch.zeros(pad_size, dtype=self.o_pred.dtype)
+                self.o_pred = torch.cat([self.o_pred, padding])
+            else:
+                self.o_pred = self.o_pred[:lower_o.shape[0]]
         
         # Precision weighting with dimension checking
         Pi_normalized = self.Pi / (self.Pi.sum() + 1e-8)

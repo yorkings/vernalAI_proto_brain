@@ -22,6 +22,15 @@ class HierarchicalController:
         
     def propose(self, top_o: torch.Tensor) -> torch.Tensor:
         """Generate action prior from top-level representation"""
+        if top_o.shape[0] != self.rep_dim:
+            # Resize top_o to match expected dimension
+            if top_o.shape[0] > self.rep_dim:
+                top_o = top_o[:self.rep_dim]  # Truncate
+            else:
+                # Pad with zeros
+                pad_size = self.rep_dim - top_o.shape[0]
+                top_o = torch.cat([top_o, torch.zeros(pad_size, dtype=top_o.dtype)])
+
         self.last_top_state = top_o.clone().detach()
         
         # Linear transformation

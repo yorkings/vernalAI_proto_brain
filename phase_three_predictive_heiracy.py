@@ -17,7 +17,12 @@ class PredictiveHierarchy:
         
         # State tracking
         self.current_states = [None] * self.L
-        self.current_predictions = [None] * self.L
+        # Initialize predictions with current states
+        self.current_predictions = []
+        for level in self.levels:
+            # Initialize with whatever state the level has
+            pred = level.topdown_predict() if hasattr(level, 'topdown_predict') else level.o.clone()
+            self.current_predictions.append(pred)
         
     def step(self, sensory_input: torch.Tensor,delta_da: Optional[float] = None,plasticity_gate: float = 1.0,inference_iterations: int = 2) -> torch.Tensor:
         """
@@ -67,17 +72,6 @@ class PredictiveHierarchy:
             for ell in range(1, self.L):
                 # Get lower state with dimension checking
                 lower_state = self.levels[ell-1].summarize_lower()
-                current_pred_dim = self.levels[ell].o_pred.shape[0] if hasattr(self.levels[ell], 'o_pred') else None
-                
-                # Ensure dimensions are compatible
-                if current_pred_dim is not None and lower_state.shape[0] != current_pred_dim:
-                    # Adjust lower state to match prediction dimension
-                    if lower_state.shape[0] < current_pred_dim:
-                        pad_size = current_pred_dim - lower_state.shape[0]
-                        lower_state = torch.cat([lower_state, torch.zeros(pad_size, dtype=lower_state.dtype)])
-                    else:
-                        lower_state = lower_state[:current_pred_dim]
-                
                 # Re-infer with current predictions
                 level_state = self.levels[ell].infer_update(lower_state)
                 self.current_states[ell] = level_state
@@ -136,7 +130,8 @@ class PredictiveHierarchy:
                 self.stats['convergence_history'].append(convergence)
                 if len(self.stats['convergence_history']) > 100:
                     self.stats['convergence_history'].pop(0)
-        
+        print(f"[HIERARCHY DEBUG] current_states dimensions: {[s.shape if s is not None else 'None' for s in self.current_states]}")
+        print(f"[HIERARCHY DEBUG] Returning state from level {len(self.current_states)-1} with dim {self.current_states[-1].shape[0]}")               
         return self.current_states[-1]
         
     def get_hierarchy_state(self) -> Dict:

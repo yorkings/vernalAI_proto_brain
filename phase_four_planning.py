@@ -10,10 +10,10 @@ class BiologicalPlanner:
         self.goal_system = goal_system
         
         # Get state dimension from forward simulator's cortical block
-        self.state_dim = forward_sim.block.C  # Should be 4 (number of columns)
+        self.state_dim = forward_sim.block.C  # Should be 4(number of columns)
         
         # Get goal dimension from goal system
-        self.goal_dim = goal_system.goal_column.layer.num_neurons  # Should be 32
+        self.goal_dim = goal_system.goal_column.layer.num_neurons 
         
         print(f"[PLANNER INIT] State dim: {self.state_dim}, Goal dim: {self.goal_dim}")
         
@@ -152,6 +152,7 @@ class BiologicalPlanner:
         self.action_momentum = torch.zeros(len(self.actions))
         self.recent_fingerprints.clear()
         print("[PLANNER] Reset complete")
+
 
 
 # Test function

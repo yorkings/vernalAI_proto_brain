@@ -1,6 +1,7 @@
 import torch
 from phase_one_layers_neurons import ProtoLayer
 import random
+from typing import List,Optional
 torch.set_default_dtype(torch.float32)
 
 class ProtoColumn:
@@ -44,24 +45,32 @@ class ProtoColumn:
         self.last_output=normalized
         return normalized
     
-    def learn(self, target=None, delta=None, gate: float = 1.0,mix_local: float = 0.5):
+
+    def learn(self, target=None, delta=None, gate: float = 1.0, mix_local: float = 0.5,
+              DA_phasic: Optional[float] = None,
+              DA_tonic: Optional[float] = None,
+              DA_baseline: float = 0.0,
+              prediction_error: Optional[float] = None):
         """
-        Column learning rule:
-        Args:
-            target: Target vector for supervised learning
-            delta: Dopamine signal (RPE)
-            gate: External plasticity gate
-            mix_local: Blend between local and DA learning
+        Enhanced learning with Phase 5.10 plasticity gate support
         """
-        # Combine column gate with external gate
+        # Combine layer gate with external gate
         effective_gate = gate * self.plasticity_gate
         
-        # Modulate target with column trace
-        mod_target = None
-        if target is not None:
-            mod_target = target + 0.05 * self.column_trace
-        # Pass to layer
-        self.layer.learn(target=mod_target, delta=delta,gate=effective_gate, mix_local=mix_local)
+        for i, neuron in enumerate(self.layer.neurons):
+            neuron_target = target[i] if target is not None and len(target) > i else None
+            
+            # Call neuron learn with plasticity gate parameters
+            neuron.learn(
+                target=neuron_target,
+                delta=delta,
+                gate=effective_gate,
+                mix_local=mix_local,
+                DA_phasic=DA_phasic,
+                DA_tonic=DA_tonic,
+                DA_baseline=DA_baseline,
+                prediction_error=prediction_error
+            )
 
 if __name__ == "__main__":
     print("Testing ProtoColumn with Modulated Learning...")

@@ -20,9 +20,12 @@ class BioAttractorCortex(AttractorCortex):
             else:
                 # Leaky integration
                 self.working_memory = (
-                    self.wm_decay * self.working_memory +
-                    (1 - self.wm_decay) * self.stable_state
+                    self.wm_decay * self.working_memory + (1 - self.wm_decay) * self.stable_state
                 )
+        elif self.working_memory is None:
+            # Initialize even without stable_state
+            dim = self.C if hasattr(self, 'C') else 10
+            self.working_memory = torch.zeros(dim, dtype=torch.float32)        
 
 # 2. Add temporal discounting to RewardModule
 class BioRewardModule(RewardModule):
@@ -62,6 +65,27 @@ class BioPredictiveBlock(PredictiveBlock):
             error = state_t1 - (self.G @ state_t)
             self.G += self.alpha_G * torch.outer(error, state_t)
 
+class EnhancedTemporalBuffer:
+    def __init__(self, capacity=100):
+        self.states = []
+        self.errors = []
+        self.surprises = []
+        self.capacity = capacity
+        
+    def add_step(self, state, error, surprise):
+        self.states.append(state.clone())
+        self.errors.append(error)
+        self.surprises.append(surprise)
+        if len(self.states) > self.capacity:
+            self.states.pop(0)
+            self.errors.pop(0)
+            self.surprises.pop(0)
+    
+    def get_error_trend(self, window=5):
+        if len(self.errors) < window:
+            return 0.0
+        recent_errors = self.errors[-window:]
+        return recent_errors[-1] - recent_errors[0]
 
 
 
